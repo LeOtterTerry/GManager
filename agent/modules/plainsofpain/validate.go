@@ -40,8 +40,11 @@ func (m *Module) Validate(cfg []byte) []core.FieldError {
 	}
 	var errs []core.FieldError
 	if raw, ok := obj["serverName"]; ok {
-		if _, ok := asString(raw); !ok {
+		s, ok := asString(raw)
+		if !ok {
 			errs = append(errs, core.FieldError{Field: "serverName", Message: "must be a string"})
+		} else if !validServerName(s) {
+			errs = append(errs, core.FieldError{Field: "serverName", Message: fmt.Sprintf("must be a non-empty string of at most %d characters with no control characters", ServerNameMaxRunes)})
 		}
 	}
 	if raw, ok := obj["password"]; ok {
@@ -85,7 +88,54 @@ func (m *Module) Validate(cfg []byte) []core.FieldError {
 			errs = append(errs, core.FieldError{Field: "userdir", Message: "must be a string"})
 		}
 	}
+	game, gameOK := effectivePort(obj, "port", DefaultGamePort)
+	query, queryOK := effectivePort(obj, "queryPort", DefaultQueryPort)
+	if gameOK && queryOK && game == query {
+		errs = append(errs, core.FieldError{Field: "queryPort", Message: "must not equal port"})
+	}
+	apiPort, uiPort := m.managerPorts()
+	if gameOK && (game == apiPort || game == uiPort) {
+		errs = append(errs, core.FieldError{Field: "port", Message: "must not equal the manager API or UI port"})
+	}
+	if queryOK && (query == apiPort || query == uiPort) {
+		errs = append(errs, core.FieldError{Field: "queryPort", Message: "must not equal the manager API or UI port"})
+	}
 	return errs
+}
+
+func (m *Module) managerPorts() (int, int) {
+	apiPort, uiPort := DefaultManagerAPIPort, DefaultManagerUIPort
+	if m != nil && m.ManagerAPIPort != 0 {
+		apiPort = m.ManagerAPIPort
+	}
+	if m != nil && m.ManagerUIPort != 0 {
+		uiPort = m.ManagerUIPort
+	}
+	return apiPort, uiPort
+}
+
+func effectivePort(obj map[string]json.RawMessage, key string, fallback int) (int, bool) {
+	raw, ok := obj[key]
+	if !ok {
+		return fallback, true
+	}
+	n, ok := asPort(raw)
+	if !ok {
+		return 0, false
+	}
+	return n, true
+}
+
+func validServerName(s string) bool {
+	if s == "" || utf8.RuneCountInString(s) > ServerNameMaxRunes {
+		return false
+	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // Warnings reports non-default ports. A custom-port bug has been reported,

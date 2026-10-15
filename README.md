@@ -37,20 +37,21 @@ Requires Go 1.22 and Node.js 22.
 ```bash
 cd agent
 go test ./...
-export GMANAGER_TOKEN=dev-placeholder-token
+export GMANAGER_TOKEN=dev-placeholder-token-0123456789
 go run ./cmd/gmanager --addr 127.0.0.1:8787
 ```
 
-The token is required and is never printed. Do not commit a real token. `--addr` must be `127.0.0.1`; `0.0.0.0` and other hosts are refused.
+`GMANAGER_TOKEN` must be at least 32 characters. If it is unset, the agent writes an owner-only token file at `<data-dir>/token` and does not print the token. A shorter environment value or token file is refused. Do not commit a real token. `--addr` must be `127.0.0.1`; `0.0.0.0` and other hosts are refused.
 
 Defaults:
 
-- data directory: `data/`
-- server directory: `data/servers/default/`
-- config file: `data/servers/default/configs/server.json`
-- revision metadata: `data/state/default/server.json.meta`
+- data directory: `%ProgramData%\GManager` on Windows, `data/` otherwise
+- server directory: `<data-dir>/servers/default/`
+- config file: `<data-dir>/servers/default/configs/server.json`
+- revision metadata: `<data-dir>/state/default/server.json.meta`
+- token file, when generated: `<data-dir>/token`
 
-Flags: `--data-dir`, `--server-dir`, `--instance` (default `default`).
+Flags: `--data-dir`, `--server-dir`, `--instance` (default `default`), `--ui-port` (default `5173`). An instance id starts with a letter or digit and may contain letters, digits, `_`, and `-`, up to 64 characters. The API accepts a browser `Origin` only on `--ui-port`.
 
 Dashboard, in another terminal:
 

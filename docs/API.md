@@ -1,8 +1,8 @@
 # GManager local API (v0.1 foundation)
 
-The agent listens on **127.0.0.1 only**. There is no CORS. A request whose `Host` is not `127.0.0.1` or `localhost`, or whose `Origin` (when sent) is not `http`/`https` on those hosts, is rejected with **403**.
+The agent listens on **127.0.0.1 only**. There is no CORS. A request whose `Host` is not `127.0.0.1` or `localhost` is rejected with **403**. When `Origin` is sent it must be `http` or `https` on `127.0.0.1` or `localhost` and the port must be the dashboard UI port (default **5173**, `--ui-port`). Any other origin is **403**. An empty `Origin` is allowed.
 
-Callers send `Authorization: Bearer <token>`. The token is the `GMANAGER_TOKEN` environment variable. A missing or wrong token is **401**. The process does not log the token.
+Callers send `Authorization: Bearer <token>`. The token is `GMANAGER_TOKEN` when that value is at least 32 characters. Otherwise the agent reads `<data-dir>/token`, or creates that file from `crypto/rand` with owner-only permissions. A missing or wrong token is **401**. The process does not log the token. Comparison hashes both sides and uses a constant-time compare.
 
 Paths are namespaced by instance: `/api/v1/servers/{instanceId}/...`. v0.1 has one instance, default id `default`.
 
@@ -10,7 +10,7 @@ This slice implements the contract below. Process control, SteamCMD, backups, an
 
 ## Rate limit
 
-Default: **120 requests per minute** per client IP (`DefaultRateLimit`, `DefaultRateWindow`). Every request counts, including 401 and 403.
+Default: **120 requests per minute** per client IP (`DefaultRateLimit`, `DefaultRateWindow`). Authentication runs first. A **401** does not consume the limit. Authenticated requests count, including a later **403**.
 
 When the limit is exceeded the response is **429** with `Retry-After` set to a whole number of seconds.
 
@@ -73,7 +73,7 @@ These two actions are destructive. The other writes are not.
 
 `lastKnown` is present only when `externalChange` is true. `warnings` includes non-default Plains of Pain ports. `content` is omitted when the file is not valid JSON; `raw` is still returned.
 
-The agent stores `{revision, sha256, mtime, size}` of the last file it acknowledged. A later read or write re-hashes the file and compares mtime and size. A difference is an external edit: the revision bumps, the file is not rewritten, and `externalChange` is true.
+The agent stores `{revision, sha256, mtime, size}` of the last file it acknowledged, plus a copy of that body with `password` removed. The metadata file keeps a sha256 of the password's raw JSON so a later save can merge against the live file. It does not store the password itself. A later read or write re-hashes the file and compares mtime and size. A difference is an external edit: the revision bumps, the file is not rewritten, and `externalChange` is true.
 
 `PUT /api/v1/servers/{instanceId}/config`
 

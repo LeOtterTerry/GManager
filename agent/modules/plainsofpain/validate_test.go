@@ -13,6 +13,7 @@ func TestValidateAcceptsBoundaries(t *testing.T) {
 		`{"password":"12345678901234567890","maxPlayers":200,"difficulty":4,"worldSize":51}`,
 		`{"password":"éééééééééééééééééééé","difficulty":255,"worldSize":31}`,
 		`{"serverName":"Plains","port":7777,"queryPort":27016}`,
+		`{"serverName":"Åland","port":65535,"queryPort":27016}`,
 		`{"futureKey":{"n":1},"ttr":["unverified"],"worldId":1,"mapId":"x","seed":{"n":9}}`,
 		`{"adminAccountIDs":["STEAM64_PLACEHOLDER"]}`,
 		`{"adminAccountIDs":{"todo":"format unverified"}}`,
@@ -49,10 +50,20 @@ func TestValidateRejectsKnownRules(t *testing.T) {
 		{`{"worldSize":12}`, "worldSize"},
 		{`{"worldSize":20}`, "worldSize"},
 		{`{"serverName":1}`, "serverName"},
+		{`{"serverName":""}`, "serverName"},
+		{"{\"serverName\":\"bad\\nname\"}", "serverName"},
+		{`{"serverName":"` + strings.Repeat("a", 65) + `"}`, "serverName"},
 		{`{"userdir":1}`, "userdir"},
 		{`{"port":0}`, "port"},
+		{`{"port":65536}`, "port"},
 		{`{"port":70000}`, "port"},
+		{`{"queryPort":0}`, "queryPort"},
+		{`{"queryPort":65536}`, "queryPort"},
 		{`{"queryPort":"27016"}`, "queryPort"},
+		{`{"port":27016}`, "queryPort"},
+		{`{"port":7777,"queryPort":7777}`, "queryPort"},
+		{`{"port":8787}`, "port"},
+		{`{"queryPort":5173}`, "queryPort"},
 		{`[]`, ""},
 		{`null`, ""},
 		{``, ""},
@@ -117,6 +128,10 @@ func TestSchemaMatchesVerifiedRules(t *testing.T) {
 	pw := schema.Properties["password"]
 	if pw.MaxLength == nil || *pw.MaxLength != PasswordMaxRunes {
 		t.Fatalf("password maxLength = %v", pw.MaxLength)
+	}
+	name := schema.Properties["serverName"]
+	if name.MaxLength == nil || *name.MaxLength != ServerNameMaxRunes {
+		t.Fatalf("serverName maxLength = %v", name.MaxLength)
 	}
 	players := schema.Properties["maxPlayers"]
 	if players.Minimum == nil || players.Maximum == nil || *players.Minimum != MaxPlayersMin || *players.Maximum != MaxPlayersMax {

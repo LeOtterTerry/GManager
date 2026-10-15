@@ -106,9 +106,13 @@ func TestAuthHostOriginAndRateLimit(t *testing.T) {
 	if status != http.StatusOK || !bytes.Contains(body, []byte(`"bindHost":"127.0.0.1"`)) {
 		t.Fatalf("health = %d %s", status, body)
 	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodGet, "/api/v1/health", "test-token", "", nil)
+	if status != http.StatusOK {
+		t.Fatalf("second authenticated request = %d %s", status, body)
+	}
 	status, body, hdr := do(t, httpSrv.URL, http.MethodGet, "/api/v1/health", "test-token", "", nil)
 	if status != http.StatusTooManyRequests {
-		t.Fatalf("third request = %d %s", status, body)
+		t.Fatalf("third authenticated request = %d %s", status, body)
 	}
 	retryAfter, err := strconv.Atoi(hdr.Get("Retry-After"))
 	if err != nil || retryAfter < 1 {
@@ -138,6 +142,27 @@ func TestAuthHostOriginAndRateLimit(t *testing.T) {
 	status, _, _ = do(t, open.URL, http.MethodGet, "/api/v1/health", "test-token", "", map[string]string{"Origin": "http://127.0.0.1:5173"})
 	if status != http.StatusOK {
 		t.Fatalf("local origin = %d", status)
+	}
+	status, _, _ = do(t, open.URL, http.MethodGet, "/api/v1/health", "test-token", "", map[string]string{"Origin": "http://127.0.0.1:8787"})
+	if status != http.StatusForbidden {
+		t.Fatalf("api-port origin = %d", status)
+	}
+	status, _, _ = do(t, open.URL, http.MethodGet, "/api/v1/health", "short", "", nil)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("short token = %d", status)
+	}
+}
+
+func TestInstanceID(t *testing.T) {
+	for _, id := range []string{"default", "A", "server_1", "a-b"} {
+		if err := ValidateInstanceID(id); err != nil {
+			t.Errorf("ValidateInstanceID(%q) = %v", id, err)
+		}
+	}
+	for _, id := range []string{"", "..", "a/b", "a\\b", "-lead", ".hidden", "has space", strings.Repeat("a", 65)} {
+		if err := ValidateInstanceID(id); err == nil {
+			t.Errorf("ValidateInstanceID(%q) accepted", id)
+		}
 	}
 }
 

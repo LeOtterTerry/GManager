@@ -7,7 +7,10 @@
   "description": "Known keys are validated. Unknown keys must be preserved on save. Fields marked UNVERIFIED are not type-checked.",
   "properties": {
     "serverName": {
-      "type": "string"
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "description": "Non-empty, at most 64 characters, no ASCII control characters."
     },
     "password": {
       "type": "string",

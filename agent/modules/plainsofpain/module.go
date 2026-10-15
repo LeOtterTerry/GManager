@@ -33,6 +33,12 @@ const (
 
 	// PasswordMaxRunes is the longest accepted password.
 	PasswordMaxRunes = 20
+	// ServerNameMaxRunes is the longest accepted serverName.
+	ServerNameMaxRunes = 64
+	// DefaultManagerAPIPort is the agent listen port when --addr is left alone.
+	DefaultManagerAPIPort = 8787
+	// DefaultManagerUIPort is the dashboard origin port when --ui-port is left alone.
+	DefaultManagerUIPort = 5173
 	// MaxPlayersMin is the smallest accepted maxPlayers.
 	MaxPlayersMin = 1
 	// MaxPlayersMax is the largest accepted maxPlayers.
@@ -47,10 +53,20 @@ var schemaJSON []byte
 var readyMatcher = regexp.MustCompile(regexp.QuoteMeta(ReadyLine) + `(?:[^A-Za-z0-9]|$)`)
 
 // Module implements core.GameModule for Plains of Pain.
-type Module struct{}
+// ManagerAPIPort and ManagerUIPort are rejected as the game port and query port.
+// Zero means the defaults above.
+type Module struct {
+	ManagerAPIPort int
+	ManagerUIPort  int
+}
 
 // New returns the Plains of Pain module.
-func New() *Module { return &Module{} }
+func New() *Module {
+	return &Module{
+		ManagerAPIPort: DefaultManagerAPIPort,
+		ManagerUIPort:  DefaultManagerUIPort,
+	}
+}
 
 var _ core.GameModule = (*Module)(nil)
 

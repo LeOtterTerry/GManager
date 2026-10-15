@@ -9,12 +9,14 @@
 package config
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -106,6 +108,12 @@ func NewEditor(configPath, statePath string) (*Editor, error) {
 	if configPath == statePath {
 		return nil, errors.New("state path must not be the config file")
 	}
+	if err := cleanupTemps(filepath.Dir(configPath), filepath.Base(configPath)); err != nil {
+		return nil, err
+	}
+	if err := cleanupTemps(filepath.Dir(statePath), filepath.Base(statePath)); err != nil {
+		return nil, err
+	}
 	return &Editor{configPath: configPath, statePath: statePath}, nil
 }
 
@@ -118,8 +126,11 @@ type snapshot struct {
 	MtimeUnixNano int64  `json:"mtimeUnixNano"`
 	Size          int64  `json:"size"`
 	Body          []byte `json:"body"`
-	Drift         bool   `json:"drift"`
-	DriftSHA      string `json:"driftSha256"`
+	// Redacted holds sha256 hex of secret raw values removed from Body before
+	// the snapshot is written. The in-memory body keeps those values.
+	Redacted map[string]string `json:"redacted,omitempty"`
+	Drift    bool              `json:"drift"`
+	DriftSHA string            `json:"driftSha256"`
 }
 
 type diskFile struct {
@@ -141,6 +152,9 @@ func (e *Editor) Read() (ReadResult, error) {
 	disk, err := e.readDisk()
 	if err != nil {
 		return ReadResult{}, err
+	}
+	if exists {
+		rehydrate(st, disk)
 	}
 	if !exists {
 		if disk.absent {
@@ -174,6 +188,7 @@ func (e *Editor) Save(revision int64, editJSON []byte, resolutions map[string]st
 	if err != nil {
 		return SaveResult{}, err
 	}
+	rehydrate(st, disk)
 	if err := e.observe(st, disk); err != nil {
 		return SaveResult{}, err
 	}
@@ -287,6 +302,7 @@ func adopt(st *snapshot, disk diskFile) {
 	st.MtimeUnixNano = disk.mtime.UnixNano()
 	st.Size = disk.size
 	st.Body = append([]byte(nil), disk.body...)
+	st.Redacted = nil
 	st.Drift = false
 	st.DriftSHA = ""
 }
@@ -364,12 +380,106 @@ func (e *Editor) load() (*snapshot, bool, error) {
 }
 
 func (e *Editor) persist(st *snapshot) error {
-	b, err := json.MarshalIndent(st, "", "  ")
+	stored := *st
+	if len(st.Redacted) > 0 {
+		stored.Body = append([]byte(nil), st.Body...)
+		stored.Redacted = cloneRedacted(st.Redacted)
+	} else {
+		body, redacted, err := redactPassword(st.Body)
+		if err != nil {
+			stored.Body = append([]byte(nil), st.Body...)
+			stored.Redacted = nil
+		} else {
+			stored.Body = body
+			stored.Redacted = redacted
+		}
+	}
+	b, err := json.MarshalIndent(&stored, "", "  ")
 	if err != nil {
 		return err
 	}
 	b = append(b, '\n')
 	return atomicWrite(e.statePath, b, false)
+}
+
+// redactPassword copies body with the password key removed. The returned map
+// is the sha256 of that key's raw JSON, so a later save can restore it from
+// the live file without keeping the secret in the metadata file.
+func redactPassword(body []byte) ([]byte, map[string]string, error) {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return append([]byte(nil), body...), nil, nil
+	}
+	doc, err := Parse(body)
+	if err != nil {
+		return nil, nil, err
+	}
+	raw, ok := doc.get("password")
+	if !ok {
+		return append([]byte(nil), body...), nil, nil
+	}
+	sum := sha256.Sum256(raw)
+	var order []string
+	for _, key := range doc.Order {
+		if key == "password" {
+			continue
+		}
+		order = append(order, key)
+	}
+	doc.Order = order
+	delete(doc.Values, "password")
+	return doc.Marshal(), map[string]string{"password": hex.EncodeToString(sum[:])}, nil
+}
+
+func rehydrate(st *snapshot, disk diskFile) {
+	if st == nil || len(st.Redacted) == 0 || disk.absent {
+		return
+	}
+	restored, ok := restoreRedacted(st.Body, st.Redacted, disk.body)
+	if !ok {
+		return
+	}
+	st.Body = restored
+	st.Redacted = nil
+}
+
+// restoreRedacted puts the on-disk password back into base when its raw JSON
+// hashes to the stored digest. A different on-disk password stays out of base
+// so the merge treats it as an external change.
+func restoreRedacted(base []byte, redacted map[string]string, diskBody []byte) ([]byte, bool) {
+	want := redacted["password"]
+	if want == "" {
+		return base, false
+	}
+	diskDoc, err := Parse(diskBody)
+	if err != nil {
+		return base, false
+	}
+	raw, ok := diskDoc.get("password")
+	if !ok {
+		return base, false
+	}
+	sum := sha256.Sum256(raw)
+	if hex.EncodeToString(sum[:]) != want {
+		return base, false
+	}
+	baseDoc, err := Parse(base)
+	if err != nil {
+		return base, false
+	}
+	if _, exists := baseDoc.Values["password"]; exists {
+		return base, false
+	}
+	baseDoc.Order = append(baseDoc.Order, "password")
+	baseDoc.Values["password"] = append(json.RawMessage(nil), raw...)
+	return baseDoc.Marshal(), true
+}
+
+func cloneRedacted(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 func mergeDocs(base, disk, edit *Doc, resolutions map[string]string) (*Doc, []Conflict, error) {

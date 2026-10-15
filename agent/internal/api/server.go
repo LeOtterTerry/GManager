@@ -8,12 +8,14 @@
 package api
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +31,20 @@ var (
 	errForeignOrigin = errors.New("foreign origin")
 )
 
+// DefaultUIPort is the dashboard origin the API accepts when Options.UIPort is unset.
+const DefaultUIPort = 5173
+
+// instanceIDPattern is one leading letter or digit, then up to 63 more of those plus _ and -.
+var instanceIDPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,63})$`)
+
+// ValidateInstanceID rejects empty ids, path characters, and leading punctuation.
+func ValidateInstanceID(id string) error {
+	if !instanceIDPattern.MatchString(id) {
+		return fmt.Errorf("invalid instance id %q", id)
+	}
+	return nil
+}
+
 // Options configures a local API server.
 type Options struct {
 	Token      string
@@ -40,11 +56,14 @@ type Options struct {
 	Logs       *LogStore
 	Limiter    *Limiter
 	Idem       *IdempotencyStore
+	// UIPort is the only origin port a browser may send. Zero uses DefaultUIPort.
+	UIPort int
 }
 
 // Server serves the local agent API.
 type Server struct {
-	token      string
+	tokenSum   [sha256.Size]byte
+	uiPort     int
 	instanceID string
 	inst       core.Instance
 	mod        core.GameModule
@@ -85,8 +104,13 @@ func New(opt Options) (*Server, error) {
 	if opt.Idem == nil {
 		opt.Idem = NewIdempotencyStore()
 	}
+	uiPort := opt.UIPort
+	if uiPort == 0 {
+		uiPort = DefaultUIPort
+	}
 	s := &Server{
-		token:      opt.Token,
+		tokenSum:   sha256.Sum256([]byte(opt.Token)),
+		uiPort:     uiPort,
 		instanceID: opt.InstanceID,
 		inst:       opt.Instance,
 		mod:        opt.Module,
@@ -152,6 +176,10 @@ func (s *Server) routes() http.Handler {
 
 func (s *Server) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, s.tokenSum) {
+			writeJSON(w, http.StatusUnauthorized, errorBody{Error: "unauthorized", Message: "bearer token required"})
+			return
+		}
 		ok, retry := s.limiter.Allow(clientIP(r))
 		if !ok {
 			sec := int((retry + time.Second - 1) / time.Second)
@@ -165,16 +193,12 @@ func (s *Server) wrap(next http.Handler) http.Handler {
 			})
 			return
 		}
-		if err := checkRequest(r); err != nil {
+		if err := checkRequest(r, s.uiPort); err != nil {
 			if errors.Is(err, errForeignOrigin) {
 				writeJSON(w, http.StatusForbidden, errorBody{Error: "forbidden_origin", Message: "foreign Origin is rejected"})
 				return
 			}
 			writeJSON(w, http.StatusForbidden, errorBody{Error: "forbidden_host", Message: "agent accepts requests for 127.0.0.1 only"})
-			return
-		}
-		if !authorized(r, s.token) {
-			writeJSON(w, http.StatusUnauthorized, errorBody{Error: "unauthorized", Message: "bearer token required"})
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -189,7 +213,7 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
-func checkRequest(r *http.Request) error {
+func checkRequest(r *http.Request, uiPort int) error {
 	host := r.Host
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
@@ -212,16 +236,17 @@ func checkRequest(r *http.Request) error {
 	if !strings.EqualFold(name, "127.0.0.1") && !strings.EqualFold(name, "localhost") {
 		return errForeignOrigin
 	}
+	if u.Port() != strconv.Itoa(uiPort) {
+		return errForeignOrigin
+	}
 	return nil
 }
 
-func authorized(r *http.Request, token string) bool {
+func authorized(r *http.Request, tokenSum [sha256.Size]byte) bool {
 	got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if !ok {
 		return false
 	}
-	if len(got) != len(token) {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
+	sum := sha256.Sum256([]byte(got))
+	return subtle.ConstantTimeCompare(sum[:], tokenSum[:]) == 1
 }

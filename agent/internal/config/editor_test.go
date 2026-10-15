@@ -384,3 +384,65 @@ func TestMtimeOnlyChangeIsExternalAndDoesNotRewrite(t *testing.T) {
 		t.Fatalf("mtime-only file was rewritten: %s", readFile(t, path))
 	}
 }
+
+func TestNewEditorRemovesLeftoverTemps(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "configs", "server.json")
+	if err := os.MkdirAll(filepath.Dir(cfg), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	orphan := cfg + ".tmp-orphan"
+	if err := os.WriteFile(orphan, []byte("junk"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewEditor(cfg, filepath.Join(dir, "state", "server.json.meta")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(orphan); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphan temp: %v", err)
+	}
+}
+
+func TestMetaDoesNotStorePassword(t *testing.T) {
+	ed, path := newTestEditor(t)
+	const secret = "pw-PLAINTEXT-do-not-store"
+	writeFile(t, path, "{\"serverName\":\"A\",\"password\":\""+secret+"\"}\n")
+	seen := mustRead(t, ed)
+	metaPath := filepath.Join(filepath.Dir(filepath.Dir(path)), "state", "server.json.meta")
+	meta := readFile(t, metaPath)
+	if strings.Contains(meta, secret) {
+		t.Fatalf("metadata contains the password:\n%s", meta)
+	}
+	var snap struct {
+		Body     []byte            `json:"body"`
+		Redacted map[string]string `json:"redacted"`
+	}
+	if err := json.Unmarshal([]byte(meta), &snap); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(snap.Body), secret) || bytes.Contains(snap.Body, []byte(`"password"`)) {
+		t.Fatalf("stored body still has the password: %s", snap.Body)
+	}
+	if snap.Redacted["password"] == "" {
+		t.Fatal("password digest was not stored")
+	}
+
+	reloaded, err := NewEditor(path, metaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved, err := reloaded.Save(seen.Revision, []byte(`{"serverName":"B"}`), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(saved.Body), secret) {
+		t.Fatalf("reloaded save dropped the password: %s", saved.Body)
+	}
+	if !strings.Contains(readFile(t, path), secret) || !strings.Contains(readFile(t, path), `"B"`) {
+		t.Fatalf("config file = %s", readFile(t, path))
+	}
+	again := readFile(t, metaPath)
+	if strings.Contains(again, secret) {
+		t.Fatalf("metadata contains the password after save:\n%s", again)
+	}
+}
