@@ -7,6 +7,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"net"
@@ -19,6 +20,8 @@ import (
 	"github.com/LeOtterTerry/GManager/agent/internal/api"
 	"github.com/LeOtterTerry/GManager/agent/internal/config"
 	"github.com/LeOtterTerry/GManager/agent/internal/core"
+	"github.com/LeOtterTerry/GManager/agent/internal/steamcmd"
+	"github.com/LeOtterTerry/GManager/agent/internal/supervisor"
 	"github.com/LeOtterTerry/GManager/agent/modules/plainsofpain"
 )
 
@@ -30,6 +33,8 @@ func main() {
 	dataDir := flag.String("data-dir", "", "agent data directory (default %ProgramData%\\GManager on Windows, data otherwise)")
 	serverDir := flag.String("server-dir", "", "game server directory (default <data-dir>/servers/<instance>)")
 	uiPort := flag.Int("ui-port", api.DefaultUIPort, "dashboard origin port")
+	stopMethod := flag.String("stop-method", "", "stop override: empty uses the module; interrupt is SIGTERM on Unix and is not a confirmed Plains of Pain clean stop")
+	console := flag.Bool("console-commands", false, "pass -cc (UNVERIFIED on Windows; default false)")
 	flag.Parse()
 
 	dirData := *dataDir
@@ -53,6 +58,11 @@ func main() {
 	if err != nil {
 		stderr.Fatal(err)
 	}
+	switch core.StopMethod(*stopMethod) {
+	case core.StopUnknown, core.StopInterrupt:
+	default:
+		stderr.Fatal("stop-method must be empty or interrupt")
+	}
 
 	dir := *serverDir
 	if dir == "" {
@@ -68,13 +78,30 @@ func main() {
 	if err != nil {
 		stderr.Fatal(err)
 	}
+	logs := api.NewLogStore()
+	sup := supervisor.New(supervisor.DefaultPolicy(), func(line string) {
+		logs.Append(line)
+	})
+	sup.SetStopMethod(core.StopMethod(*stopMethod))
+	steam := steamcmd.New(filepath.Join(dirData, "steamcmd"))
+	backup := func(context.Context, core.Instance) error {
+		return supervisor.ErrBackupNotConfigured
+	}
 	srv, err := api.New(api.Options{
 		Token:      token,
 		InstanceID: *instance,
-		Instance:   core.Instance{ID: *instance, Dir: dir},
+		Instance: core.Instance{
+			ID:                    *instance,
+			Dir:                   dir,
+			EnableConsoleCommands: *console,
+		},
 		Module:     mod,
 		Editor:     editor,
 		UIPort:     *uiPort,
+		Logs:       logs,
+		Supervisor: sup,
+		Steam:      steam,
+		Backup:     backup,
 	})
 	if err != nil {
 		stderr.Fatal(err)

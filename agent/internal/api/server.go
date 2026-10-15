@@ -47,15 +47,19 @@ func ValidateInstanceID(id string) error {
 
 // Options configures a local API server.
 type Options struct {
-	Token      string
-	InstanceID string
-	Instance   core.Instance
-	Module     core.GameModule
-	Editor     *config.Editor
-	Jobs       *JobRunner
-	Logs       *LogStore
-	Limiter    *Limiter
-	Idem       *IdempotencyStore
+	Token        string
+	InstanceID   string
+	Instance     core.Instance
+	Module       core.GameModule
+	Editor       *config.Editor
+	Jobs         *JobRunner
+	Logs         *LogStore
+	Limiter      *Limiter
+	Idem         *IdempotencyStore
+	Supervisor   *supervisor.Supervisor
+	Steam        supervisor.AppUpdater
+	Backup       supervisor.BackupFunc
+	ReadyTimeout time.Duration
 	// UIPort is the only origin port a browser may send. Zero uses DefaultUIPort.
 	UIPort int
 }
@@ -72,7 +76,9 @@ type Server struct {
 	logs       *LogStore
 	limiter    *Limiter
 	idem       *IdempotencyStore
-	sup        supervisor.Supervisor
+	sup        *supervisor.Supervisor
+	steam      supervisor.AppUpdater
+	backup     supervisor.BackupFunc
 	acceptMu   sync.Mutex
 	handler    http.Handler
 }
@@ -108,6 +114,17 @@ func New(opt Options) (*Server, error) {
 	if uiPort == 0 {
 		uiPort = DefaultUIPort
 	}
+	if opt.Supervisor == nil {
+		pol := supervisor.DefaultPolicy()
+		if opt.ReadyTimeout > 0 {
+			pol.ReadyTimeout = opt.ReadyTimeout
+		}
+		logs := opt.Logs
+		opt.Supervisor = supervisor.New(pol, func(line string) {
+			logs.Append(line)
+		})
+	}
+	opt.Supervisor.Attach(opt.Instance, opt.Module)
 	s := &Server{
 		tokenSum:   sha256.Sum256([]byte(opt.Token)),
 		uiPort:     uiPort,
@@ -119,13 +136,19 @@ func New(opt Options) (*Server, error) {
 		logs:       opt.Logs,
 		limiter:    opt.Limiter,
 		idem:       opt.Idem,
+		sup:        opt.Supervisor,
+		steam:      opt.Steam,
+		backup:     opt.Backup,
 	}
 	s.handler = s.wrap(s.routes())
 	return s, nil
 }
 
-// Logs exposes the cursor log so the process supervisor can append later.
+// Logs exposes the cursor log.
 func (s *Server) Logs() *LogStore { return s.logs }
+
+// Supervisor is the process host for this server.
+func (s *Server) Supervisor() *supervisor.Supervisor { return s.sup }
 
 // Handler returns the API handler.
 func (s *Server) Handler() http.Handler { return s.handler }

@@ -6,7 +6,7 @@ Callers send `Authorization: Bearer <token>`. The token is `GMANAGER_TOKEN` when
 
 Paths are namespaced by instance: `/api/v1/servers/{instanceId}/...`. v0.1 has one instance, default id `default`.
 
-This slice implements the contract below. Process control, SteamCMD, backups, and durable logs are not implemented yet; accepted jobs say so in their result instead of pretending the game server changed.
+Start, stop, restart, install, and update run against the process supervisor. Install and update call the configured SteamCMD runner (`login anonymous`, `app_update 2227360 validate`). The runner is not contacted by tests or CI. Backup and restore are still accepted jobs that record `implemented: false`. Logs are in memory.
 
 ## Rate limit
 
@@ -32,7 +32,9 @@ Writes return **202**:
 
 `state` is `queued`, `running`, `succeeded`, or `failed`. Unknown ids are **404**. Finished jobs are kept in memory for 15 minutes (`DefaultRetention`) and then dropped, which also returns **404**.
 
-In this slice, config saves are decided before the response (so a conflict is a synchronous **409**, not a failed job). An accepted config save is recorded as a job that is already `succeeded`. Other accepted actions are real jobs. `start` builds the module launch plan and does **not** spawn a process, and it does **not** rewrite config. `stop`, `restart`, `install`, `update`, `backup`, and `restore` record `implemented: false`.
+Config saves are decided before the response (so a conflict is a synchronous **409**, not a failed job). An accepted config save is recorded as a job that is already `succeeded`. Other accepted actions are real jobs.
+
+`start` spawns the module executable and waits for the ready line. It does **not** rewrite config. A missing executable fails the job. `stop` uses the module stop method (unknown for Plains of Pain, so the process is killed) and requires `confirm: true`. `restart` stops, then starts. `install` runs SteamCMD into the instance directory and does not start the server. `update` stops, runs the backup hook, snapshots game files except `configs/server.json`, runs SteamCMD, and starts. If the update or the new build fails, the snapshot is restored and a server that was running is started again. The default backup hook fails closed until a backup implementation exists. `backup` and `restore` still record `implemented: false`.
 
 ## Idempotency
 
@@ -122,17 +124,17 @@ The store is in memory in this slice. File tailing, websockets, and surviving an
 
 - `GET /api/v1/health` → `{"status":"ok","bindHost":"127.0.0.1"}`
 - `GET /api/v1/servers` → `{"instances":[{"id","gameId","displayName"}]}`
-- `GET /api/v1/servers/{instanceId}/status` → `state` is `stopped` in this slice, `ready` is false, and `ports` comes from the module (Plains of Pain defaults UDP 7777 and UDP 27016).
+- `GET /api/v1/servers/{instanceId}/status` → `state` (`stopped`, `starting`, `running`, `crashed`, `updating`), `ready`, `uptimeSeconds`, `pid` (`null` when there is no process), `restarts`, `message`, and `ports` from the module (Plains of Pain defaults UDP 7777 and UDP 27016). `memoryBytes` and `cpuPercent` are present only when the host produced a sample. `running` means the ready line was seen.
 
 ## Writes in this slice
 
-| Method and path | Confirm | What the job does now |
+| Method and path | Confirm | What the job does |
 |---|---|---|
-| `POST .../start` | no | Launch plan only. Does not start a process or touch config. |
-| `POST .../stop` | yes | Recorded, not implemented. |
-| `POST .../restart` | no | Recorded, not implemented. |
-| `POST .../install` | no | Recorded, not implemented. Returns the module install spec. |
-| `POST .../update` | no | Recorded, not implemented. |
+| `POST .../start` | no | Spawns the server and waits until ready. Does not touch config. |
+| `POST .../stop` | yes | Stops the process. A requested stop is not a crash. |
+| `POST .../restart` | no | Stop, then start. |
+| `POST .../install` | no | Anonymous SteamCMD install. Does not start the server. |
+| `POST .../update` | no | Stop, backup hook, update, start. Restores the previous build on failure. |
 | `POST .../backup` | no | Recorded, not implemented. |
 | `POST .../restore` | yes | Recorded, not implemented. |
 | `PUT .../config` | no | Validates, merges, and writes as described above. |

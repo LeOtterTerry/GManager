@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,9 +12,11 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/LeOtterTerry/GManager/agent/internal/config"
 	"github.com/LeOtterTerry/GManager/agent/internal/core"
+	"github.com/LeOtterTerry/GManager/agent/internal/supervisor"
 )
 
 const maxBody = 1 << 20
@@ -62,16 +65,29 @@ func (s *Server) getStatus(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		raw = nil
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	st := s.sup.Status()
+	var pid any
+	if st.PID > 0 {
+		pid = st.PID
+	}
+	body := map[string]any{
 		"instanceId":    s.instanceID,
 		"gameId":        s.mod.ID(),
-		"state":         "stopped",
-		"ready":         false,
-		"uptimeSeconds": 0,
-		"pid":           nil,
+		"state":         st.State,
+		"ready":         st.Ready,
+		"uptimeSeconds": uptimeSeconds(st),
+		"pid":           pid,
 		"ports":         s.mod.Ports(raw),
-		"message":       "process supervisor is not running in this slice",
-	})
+		"message":       st.Message,
+		"restarts":      st.Restarts,
+	}
+	if st.MemoryKnown {
+		body["memoryBytes"] = st.MemoryBytes
+	}
+	if st.CPUKnown {
+		body["cpuPercent"] = st.CPUPercent
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func (s *Server) postStart(w http.ResponseWriter, r *http.Request) {
@@ -79,28 +95,19 @@ func (s *Server) postStart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) postStop(w http.ResponseWriter, r *http.Request) {
-	s.acceptAction(w, r, true, "stop", func() (any, error) {
-		return map[string]any{"action": "stop", "implemented": false, "reason": "process control is not in this slice"}, nil
-	})
+	s.acceptAction(w, r, true, "stop", s.stopWork)
 }
 
 func (s *Server) postRestart(w http.ResponseWriter, r *http.Request) {
-	s.acceptAction(w, r, false, "restart", func() (any, error) {
-		return map[string]any{"action": "restart", "implemented": false, "reason": "process control is not in this slice"}, nil
-	})
+	s.acceptAction(w, r, false, "restart", s.restartWork)
 }
 
 func (s *Server) postInstall(w http.ResponseWriter, r *http.Request) {
-	s.acceptAction(w, r, false, "install", func() (any, error) {
-		spec := s.mod.Install()
-		return map[string]any{"action": "install", "implemented": false, "install": spec, "reason": "SteamCMD runner is not in this slice"}, nil
-	})
+	s.acceptAction(w, r, false, "install", s.installWork)
 }
 
 func (s *Server) postUpdate(w http.ResponseWriter, r *http.Request) {
-	s.acceptAction(w, r, false, "update", func() (any, error) {
-		return map[string]any{"action": "update", "implemented": false, "reason": "SteamCMD runner is not in this slice"}, nil
-	})
+	s.acceptAction(w, r, false, "update", s.updateWork)
 }
 
 func (s *Server) postBackup(w http.ResponseWriter, r *http.Request) {
@@ -116,28 +123,111 @@ func (s *Server) postRestore(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) startWork() (any, error) {
+	return s.guardConfig(func() (any, error) {
+		if err := s.sup.Start(context.Background(), s.inst, s.mod); err != nil {
+			return nil, err
+		}
+		return s.processResult("start"), nil
+	})
+}
+
+func (s *Server) stopWork() (any, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := s.sup.Stop(ctx); err != nil {
+		return nil, err
+	}
+	st := s.sup.Status()
+	return map[string]any{"action": "stop", "state": st.State}, nil
+}
+
+func (s *Server) restartWork() (any, error) {
+	return s.guardConfig(func() (any, error) {
+		if err := s.sup.Restart(context.Background()); err != nil {
+			return nil, err
+		}
+		return s.processResult("restart"), nil
+	})
+}
+
+func (s *Server) installWork() (any, error) {
+	if s.steam == nil {
+		return nil, errors.New("steamcmd is not configured")
+	}
+	return s.guardConfig(func() (any, error) {
+		if err := s.sup.Install(context.Background(), s.steam); err != nil {
+			return nil, err
+		}
+		st := s.sup.Status()
+		return map[string]any{
+			"action": "install",
+			"state":  st.State,
+			"exe":    s.mod.ExePath(s.inst),
+		}, nil
+	})
+}
+
+func (s *Server) updateWork() (any, error) {
+	if s.steam == nil {
+		return nil, errors.New("steamcmd is not configured")
+	}
+	backup := s.backup
+	if backup == nil {
+		backup = func(context.Context, core.Instance) error {
+			return supervisor.ErrBackupNotConfigured
+		}
+	}
+	return s.guardConfig(func() (any, error) {
+		if err := s.sup.Update(context.Background(), s.steam, backup); err != nil {
+			return nil, err
+		}
+		return s.processResult("update"), nil
+	})
+}
+
+func (s *Server) processResult(action string) map[string]any {
+	st := s.sup.Status()
+	return map[string]any{
+		"action":         action,
+		"exe":            s.mod.ExePath(s.inst),
+		"args":           s.mod.LaunchArgs(s.inst),
+		"state":          st.State,
+		"processStarted": st.PID > 0 || st.Ready,
+		"ready":          st.Ready,
+		"pid":            st.PID,
+	}
+}
+
+func (s *Server) guardConfig(fn func() (any, error)) (any, error) {
 	before, err := fileSHA256(s.editor.ConfigPath())
 	if err != nil {
 		return nil, err
 	}
-	launch, err := s.sup.Start(s.inst, s.mod)
-	if err != nil {
-		return nil, err
-	}
-	after, err := fileSHA256(s.editor.ConfigPath())
-	if err != nil {
-		return nil, err
+	result, err := fn()
+	after, hashErr := fileSHA256(s.editor.ConfigPath())
+	if hashErr != nil {
+		return nil, hashErr
 	}
 	if before != after {
 		return nil, errors.New("config was rewritten on start")
 	}
-	return map[string]any{
-		"exe":            launch.Exe,
-		"args":           launch.Args,
-		"state":          "stopped",
-		"processStarted": false,
-		"reason":         "process launch is not in this slice",
-	}, nil
+	return result, err
+}
+
+func uptimeSeconds(st supervisor.Status) int {
+	var since time.Time
+	if st.Ready && !st.ReadyAt.IsZero() {
+		since = st.ReadyAt
+	} else if st.PID > 0 && !st.StartedAt.IsZero() {
+		since = st.StartedAt
+	} else {
+		return 0
+	}
+	sec := int(time.Since(since).Seconds())
+	if sec < 0 {
+		return 0
+	}
+	return sec
 }
 
 func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
