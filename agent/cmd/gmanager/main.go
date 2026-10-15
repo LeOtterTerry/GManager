@@ -140,6 +140,14 @@ func main() {
 	for _, hold := range holds {
 		log.Printf("warning: unjournaled hold %s; restore is blocked until it is discarded", hold)
 	}
+	staging, serr := archives.StrayStaging(inst, mod)
+	if serr != nil && err == nil {
+		log.Printf("warning: restore journal: %v; restore is blocked until it is fixed", serr)
+		staging = nil
+	}
+	for _, path := range staging {
+		log.Printf("warning: unjournaled restore staging %s; discard-hold stays blocked until it is removed", path)
+	}
 	srv, err := api.New(api.Options{
 		Token:      token,
 		InstanceID: *instance,

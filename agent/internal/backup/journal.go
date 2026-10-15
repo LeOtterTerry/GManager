@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -318,7 +317,7 @@ func readJournal(dir, instanceID string, key []byte) (j journalFile, err error) 
 	dec := json.NewDecoder(f)
 	dec.DisallowUnknownFields()
 	if err = dec.Decode(&j); err != nil {
-		return journalFile{}, err
+		return journalFile{}, fmt.Errorf("%w: %v", ErrJournal, err)
 	}
 	if j.Version != journalVersion || (j.State != journalPending && j.State != journalCommitted) {
 		return journalFile{}, fmt.Errorf("%w: journal in %s is not usable", ErrJournal, dir)
@@ -537,19 +536,25 @@ func removeHold(path string) error {
 	return err
 }
 
-// journalFinished reports a committed journal whose holds are already gone.
-// journalIdle is a journal that has not swapped any target and whose named
-// holds are all still on disk. An empty hold means that destination did not
-// exist when the journal was written.
+// journalIdle reports a journal whose live destinations were not renamed.
+// A hold that is present counts as swapped: the destination was already
+// renamed into that hold, even when the journal has not recorded it. Idle
+// means no hold is present and every destination still exists.
 func journalIdle(j journalFile) bool {
 	for _, target := range j.Targets {
 		if target.Swapped {
 			return false
 		}
-		if target.Hold == "" {
-			continue
+		if target.Hold != "" {
+			_, err := os.Lstat(target.Hold)
+			if err == nil || !errors.Is(err, os.ErrNotExist) {
+				return false
+			}
 		}
-		if _, err := os.Lstat(target.Hold); err != nil {
+		if target.Dest == "" {
+			return false
+		}
+		if _, err := os.Lstat(target.Dest); err != nil {
 			return false
 		}
 	}
@@ -564,18 +569,7 @@ func journalUnusable(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, ErrJournalAuth) || errors.Is(err, ErrJournal) {
-		return true
-	}
-	var syn *json.SyntaxError
-	var typ *json.UnmarshalTypeError
-	if errors.As(err, &syn) || errors.As(err, &typ) {
-		return true
-	}
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return true
-	}
-	return strings.HasPrefix(err.Error(), "json:")
+	return errors.Is(err, ErrJournalAuth) || errors.Is(err, ErrJournal)
 }
 
 func journalFinished(j journalFile) bool {

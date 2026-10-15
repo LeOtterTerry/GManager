@@ -369,6 +369,45 @@ func (s *Server) postDiscardHold(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) postDiscardStaging(w http.ResponseWriter, r *http.Request) {
+	if !s.knownInstance(w, r) {
+		return
+	}
+	body, err := readBody(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: "invalid_body", Message: bodyReadMessage(err)})
+		return
+	}
+	s.accept(w, r, body, func() decision {
+		ok, err := confirmed(body)
+		if err != nil {
+			return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "invalid_body", Message: "body must be JSON"}}
+		}
+		if s.archives == nil {
+			return decision{Status: http.StatusNotImplemented, Body: errorBody{
+				Error:   "not_implemented",
+				Message: "backup directory is not configured",
+			}}
+		}
+		inst := s.withSaveDir(s.inst)
+		if !ok {
+			view, err := s.archives.PreviewStaging(inst, s.mod)
+			if err != nil {
+				return journalDecision(err)
+			}
+			return decision{Status: http.StatusOK, Body: struct {
+				Action string `json:"action"`
+				backup.StagingView
+			}{Action: "discard-staging-preview", StagingView: view}}
+		}
+		removed, err := s.archives.DiscardStaging(inst, s.mod)
+		if err != nil {
+			return journalDecision(err)
+		}
+		return decision{Status: http.StatusOK, Body: map[string]any{"action": "discard-staging", "paths": removed}}
+	})
+}
+
 func (s *Server) postJournal(w http.ResponseWriter, r *http.Request) {
 	if !s.knownInstance(w, r) {
 		return

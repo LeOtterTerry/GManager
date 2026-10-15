@@ -207,11 +207,12 @@ func (s *Store) RollbackJournal(inst core.Instance, mod core.GameModule, echoed 
 
 // DiscardJournal removes the instance journal file and then rotates that
 // instance's restore id. It does not rename saves, configs, or holds.
-// A journal that still records a swapped target, or whose named hold is
-// gone, is left in place with ErrRollbackRequired unless force is set and
-// restoreID is the id from the preview. An unusable journal, a finished
-// journal, or a journal that has not swapped and whose holds are still on
-// disk may be removed without that override.
+// A journal that still records a swapped target, or that has a hold on
+// disk, is left in place with ErrRollbackRequired unless force is set and
+// restoreID is the id from the preview. A present hold counts as swapped,
+// because the destination was already renamed. An unusable journal, a
+// finished journal, or an idle journal (no hold present, destinations
+// still exist) may be removed without that override.
 func (s *Store) DiscardJournal(inst core.Instance, mod core.GameModule, force bool, restoreID string) error {
 	if s == nil {
 		return errors.New("backup directory is not configured")
@@ -359,6 +360,140 @@ func (s *Store) StrayHolds(inst core.Instance, mod core.GameModule) ([]string, e
 	return out, nil
 }
 
+// StagingView lists unjournaled restore staging directories. Paths are
+// present only. Nothing is deleted.
+type StagingView struct {
+	Paths []string `json:"paths"`
+}
+
+// StrayStaging lists `.gmanager-restore-*` entries beside a save or config
+// path that the verified journal does not name. It does not delete them.
+func (s *Store) StrayStaging(inst core.Instance, mod core.GameModule) ([]string, error) {
+	if s == nil {
+		return nil, errors.New("backup directory is not configured")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.strayStaging(inst, mod)
+}
+
+// PreviewStaging is the operator view of StrayStaging.
+func (s *Store) PreviewStaging(inst core.Instance, mod core.GameModule) (StagingView, error) {
+	paths, err := s.StrayStaging(inst, mod)
+	if err != nil {
+		return StagingView{}, err
+	}
+	if paths == nil {
+		paths = []string{}
+	}
+	return StagingView{Paths: paths}, nil
+}
+
+// DiscardStaging removes unjournaled `.gmanager-restore-*` leftovers beside
+// a save or config path. A directory named by the verified journal is left
+// in place. Each delete goes through the no-follow parent handle.
+func (s *Store) DiscardStaging(inst core.Instance, mod core.GameModule) ([]string, error) {
+	if s == nil {
+		return nil, errors.New("backup directory is not configured")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	paths, err := s.strayStaging(inst, mod)
+	if err != nil {
+		return nil, err
+	}
+	var errs error
+	var removed []string
+	for _, path := range paths {
+		if err := removeAllNoFollow(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = errors.Join(errs, err)
+			continue
+		}
+		removed = append(removed, path)
+	}
+	if removed == nil {
+		removed = []string{}
+	}
+	return removed, errs
+}
+
+func (s *Store) strayStaging(inst core.Instance, mod core.GameModule) ([]string, error) {
+	allowed, err := allowedDests(inst, mod)
+	if err != nil {
+		return nil, err
+	}
+	known := map[string]struct{}{}
+	if !s.journalMissing(inst.ID) {
+		dir, err := s.journalDirectory()
+		if err != nil {
+			return nil, err
+		}
+		key, err := s.readIntegrityKey()
+		if err != nil {
+			return nil, err
+		}
+		j, err := readJournal(dir, inst.ID, key)
+		if err != nil {
+			return nil, err
+		}
+		expected, err := s.expectedRestore(inst.ID)
+		if err != nil {
+			return nil, err
+		}
+		if err := acceptJournal(j, inst.ID, expected); err != nil {
+			return nil, err
+		}
+		if err := validateJournal(j, allowed); err != nil {
+			return nil, err
+		}
+		for _, path := range j.Staging {
+			known[filepath.Clean(path)] = struct{}{}
+		}
+	}
+	seen := map[string]struct{}{}
+	var out []string
+	for _, dest := range allowed {
+		parent := filepath.Dir(dest)
+		if _, ok := seen[parent]; ok {
+			continue
+		}
+		seen[parent] = struct{}{}
+		found, err := unjournaledStaging(parent, known)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, found...)
+	}
+	return out, nil
+}
+
+func unjournaledStaging(dir string, known map[string]struct{}) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if !stagingNameOK(name) {
+			continue
+		}
+		full := filepath.Clean(filepath.Join(dir, name))
+		if holdKnown(full, known) {
+			continue
+		}
+		out = append(out, full)
+	}
+	return out, nil
+}
+
+func stagingNameOK(name string) bool {
+	return strings.HasPrefix(name, restorePrefix) && len(name) > len(restorePrefix)
+}
+
 // HoldView is the size and modification time an operator must send back
 // before a hold can be deleted.
 type HoldView struct {
@@ -387,9 +522,11 @@ func (s *Store) PreviewHold(inst core.Instance, mod core.GameModule, hold string
 }
 
 // DiscardHold removes one unjournaled hold beside a save or config path.
-// size and modTime must match a fresh stat of that hold. A destination that
-// is missing, parked under the undo suffix, or sitting next to a staging
-// directory is refused.
+// size and modTime must match a fresh stat of that hold. modTime is compared
+// with Time.UnixNano, so the preview's UTC RFC3339Nano value has to round-trip
+// every nanosecond; a value truncated to seconds does not match. A destination
+// that is missing, parked under the undo suffix, or sitting next to a
+// staging directory is refused.
 func (s *Store) DiscardHold(inst core.Instance, mod core.GameModule, hold string, size int64, modTime time.Time) error {
 	if s == nil {
 		return errors.New("backup directory is not configured")
@@ -406,6 +543,8 @@ func (s *Store) DiscardHold(inst core.Instance, mod core.GameModule, hold string
 	if destMidRestore(hold, allowed) {
 		return ErrMidRestore
 	}
+	// UnixNano, not seconds. The preview formats UTC RFC3339Nano so the
+	// fraction the operator sends back is the same instant.
 	if info.Size() != size || info.ModTime().UnixNano() != modTime.UnixNano() {
 		return ErrHoldChanged
 	}
@@ -498,7 +637,7 @@ func destMidRestore(hold string, allowed []string) bool {
 	}
 	for _, ent := range entries {
 		name := ent.Name()
-		if strings.HasPrefix(name, restorePrefix) && len(name) > len(restorePrefix) {
+		if stagingNameOK(name) {
 			return true
 		}
 	}

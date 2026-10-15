@@ -742,6 +742,37 @@ func sealedPendingJournal(t *testing.T, key []byte, save, hold, restoreID string
 	return append(raw, '\n')
 }
 
+func TestDiscardStagingAPI(t *testing.T) {
+	save := t.TempDir()
+	archives := testArchives(t, 5)
+	_, httpSrv, cfgPath := newAPIOpt(t, 50, Options{Archives: archives})
+	writeCfg(t, cfgPath, configJSON(t, save, "kept"))
+	staging := filepath.Join(filepath.Dir(save), ".gmanager-restore-left")
+	if err := os.MkdirAll(staging, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(staging, "staged.dat"), []byte("staged"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	status, body, _ := do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/discard-staging", "test-token", `{}`, nil)
+	if status != http.StatusOK || !bytes.Contains(body, []byte(`"action":"discard-staging-preview"`)) || !bytes.Contains(body, []byte(".gmanager-restore-left")) {
+		t.Fatalf("preview = %d %s", status, body)
+	}
+	if _, err := os.Stat(staging); err != nil {
+		t.Fatal("preview removed the staging directory")
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/discard-staging", "test-token", `{"confirm":true}`, nil)
+	if status != http.StatusOK || !bytes.Contains(body, []byte(`"action":"discard-staging"`)) {
+		t.Fatalf("discard = %d %s", status, body)
+	}
+	if _, err := os.Stat(staging); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging err = %v", err)
+	}
+	if _, err := os.Stat(save); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestUserDirOverrideWinsOverConfig(t *testing.T) {
 	flagDir := t.TempDir()
 	configDir := t.TempDir()
