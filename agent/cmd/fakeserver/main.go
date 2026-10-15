@@ -20,9 +20,12 @@ import (
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "--grandchild" {
-		// Stay alive until the job is killed. Do not read fakeserver.json:
-		// that would spawn another child.
-		select {}
+		// Stay alive until the job is killed. An empty select is a deadlock,
+		// and the runtime exits, so this sleeps on a timer instead.
+		// Do not read fakeserver.json: that would spawn another child.
+		for {
+			time.Sleep(time.Hour)
+		}
 	}
 	cfg := loadConfig()
 	out := bufio.NewWriter(os.Stdout)
