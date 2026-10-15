@@ -54,7 +54,7 @@ Defaults:
 
 Flags: `--data-dir`, `--server-dir`, `--instance` (default `default`), `--ui-port` (default `5173`), `--stop-method` (empty, or `interrupt`), `--console-commands` (default false). An instance id starts with a letter or digit and may contain letters, digits, `_`, and `-`, up to 64 characters. The API accepts a browser `Origin` only on `--ui-port`.
 
-`--stop-method` defaults to empty, which uses the module. Plains of Pain's clean stop is unknown, so stop kills the process. `interrupt` sends SIGTERM on Unix and is not a confirmed game stop. `--console-commands` adds `-cc`. Leave it off until that flag is confirmed. SteamCMD is stored under `<data-dir>/steamcmd`. An update refuses to run until a backup hook exists; the agent does not invent one.
+`--stop-method` defaults to empty, which uses the module. Plains of Pain's clean stop is unknown, so stop kills the process. `interrupt` sends SIGTERM on Unix and is not a confirmed game stop. `--console-commands` adds `-cc`. Leave it off until that flag is confirmed. SteamCMD is stored under `<data-dir>/steamcmd`. Restart requires `confirm: true`. Update returns 501 until a backup hook exists; the agent does not invent one.
 
 Dashboard, in another terminal:
 
@@ -86,7 +86,7 @@ These stay configurable and unresolved until a real Plains of Pain install confi
 | Topic | Behavior in this slice |
 |---|---|
 | Default save path | `SavePaths` returns an error unless `userdir` is set. No default path is invented. |
-| Clean stop on Windows | `StopStrategy` method is unknown. Stop kills the process (`TerminateProcess` on Windows, `SIGKILL` on Unix). |
+| Clean stop on Windows | `StopStrategy` method is unknown. Stop kills the process (`TerminateJobObject` on Windows, `SIGKILL` on Unix). |
 | `-cc` console flag | Omitted unless the instance sets `EnableConsoleCommands`. Off by default. |
 | `adminAccountIDs` format | Preserved verbatim. Not type-checked. Fixtures use `STEAM64_PLACEHOLDER`, never a real Steam ID. |
 | `worldId`, `mapId`, `seed`, `ttr` | Preserved verbatim. Types are not guessed. |
@@ -95,7 +95,7 @@ These stay configurable and unresolved until a real Plains of Pain install confi
 ## Not in this slice
 
 - Windows service, installer, firewall consent
-- Windows Job Object (untested; see the unverified list)
+- Containing a real Plains of Pain process tree (the fakeserver runs in a job object; the game is unverified)
 - Dashboard login (Argon2id, cookies, CSRF) and `reset-password`
 - Config form and 3-way diff UI
 - Backups, restore, scheduled restart

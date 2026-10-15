@@ -37,13 +37,17 @@ func newAPIOpt(t *testing.T, limit int, extra Options) (*Server, *httptest.Serve
 	if limit < 1 {
 		limit = 1000
 	}
+	jobs := extra.Jobs
+	if jobs == nil {
+		jobs = NewJobRunner(true)
+	}
 	opt := Options{
 		Token:      "test-token",
 		InstanceID: "default",
 		Instance:   core.Instance{ID: "default", Dir: dir},
 		Module:     plainsofpain.New(),
 		Editor:     ed,
-		Jobs:       NewJobRunner(true),
+		Jobs:       jobs,
 		Logs:       NewLogStore(),
 		Limiter:    NewLimiter(limit, time.Minute),
 		Steam:      extra.Steam,
@@ -390,7 +394,7 @@ func TestJobRunnerIsAsync(t *testing.T) {
 	runner := NewJobRunner(false)
 	started := make(chan struct{})
 	release := make(chan struct{})
-	job := runner.Start("start", "default", func() (any, error) {
+	job := runner.Start("start", "default", func(context.Context) (any, error) {
 		close(started)
 		<-release
 		return map[string]bool{"ok": true}, nil
@@ -578,6 +582,75 @@ func TestInstallAndUpdateJobs(t *testing.T) {
 	}
 	if mustRead(t, cfgPath) != before {
 		t.Fatal("config changed")
+	}
+}
+
+func TestRestartRequiresConfirmAndUpdateNeedsBackup(t *testing.T) {
+	_, httpSrv, cfgPath := newAPIOpt(t, 100, Options{})
+	writeCfg(t, cfgPath, "{\"serverName\":\"kept\"}\n")
+	status, body, _ := do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/restart", "test-token", `{}`, nil)
+	if status != http.StatusBadRequest || !bytes.Contains(body, []byte("confirm_required")) {
+		t.Fatalf("restart without confirm = %d %s", status, body)
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/restart", "test-token", `{"confirm":true}`, nil)
+	if status != http.StatusAccepted {
+		t.Fatalf("confirmed restart = %d %s", status, body)
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/update", "test-token", `{}`, nil)
+	if status != http.StatusNotImplemented || !bytes.Contains(body, []byte("not_implemented")) {
+		t.Fatalf("update without backup = %d %s", status, body)
+	}
+}
+
+type blockingSteam struct {
+	started chan struct{}
+}
+
+func (b *blockingSteam) AppUpdate(ctx context.Context, appID int, installDir string, validate, anonymous bool, log func(string)) error {
+	close(b.started)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestCancelRunningJob(t *testing.T) {
+	steam := &blockingSteam{started: make(chan struct{})}
+	_, httpSrv, _ := newAPIOpt(t, 100, Options{
+		Jobs:  NewJobRunner(false),
+		Steam: steam,
+	})
+	status, body, _ := do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/install", "test-token", `{}`, nil)
+	if status != http.StatusAccepted {
+		t.Fatalf("install = %d %s", status, body)
+	}
+	id := jsonString(t, body, "jobId")
+	select {
+	case <-steam.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("install did not start")
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/jobs/"+id+"/cancel", "test-token", `{}`, nil)
+	if status != http.StatusOK {
+		t.Fatalf("cancel = %d %s", status, body)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	var jobBody []byte
+	for time.Now().Before(deadline) {
+		jobBody = jobByID(t, httpSrv.URL, id)
+		if bytes.Contains(jobBody, []byte(`"state":"failed"`)) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !bytes.Contains(jobBody, []byte("canceled")) {
+		t.Fatalf("job = %s", jobBody)
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/jobs/"+id+"/cancel", "test-token", `{}`, nil)
+	if status != http.StatusConflict || !bytes.Contains(body, []byte("job_finished")) {
+		t.Fatalf("second cancel = %d %s", status, body)
+	}
+	status, _, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/jobs/missing/cancel", "test-token", `{}`, nil)
+	if status != http.StatusNotFound {
+		t.Fatalf("missing cancel = %d", status)
 	}
 }
 

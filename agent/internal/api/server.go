@@ -194,6 +194,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("PUT /api/v1/servers/{instanceId}/config", s.putConfig)
 	mux.HandleFunc("GET /api/v1/servers/{instanceId}/logs", s.getLogs)
 	mux.HandleFunc("GET /api/v1/jobs/{id}", s.getJob)
+	mux.HandleFunc("POST /api/v1/jobs/{id}/cancel", s.postCancelJob)
 	return mux
 }
 

@@ -23,6 +23,14 @@ func interruptProcess(cmd *exec.Cmd) error {
 	return err
 }
 
+func startProcess(cmd *exec.Cmd) (func() error, func() error, error) {
+	prepareCommand(cmd)
+	if err := cmd.Start(); err != nil {
+		return nil, nil, err
+	}
+	return nil, nil, nil
+}
+
 func killProcess(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil

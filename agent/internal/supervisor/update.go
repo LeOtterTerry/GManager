@@ -181,6 +181,13 @@ func (s *Supervisor) rollback(ctx context.Context, snap string, preserve map[str
 	s.updating = true
 	s.state = StateUpdating
 	s.mu.Unlock()
+	need, err := treeBytes(snap)
+	if err != nil {
+		return fmt.Errorf("update failed: %v; could not size the snapshot: %w", cause, err)
+	}
+	if err := hasFreeSpace(inst.Dir, need); err != nil {
+		return fmt.Errorf("update failed: %v; not enough free space to roll back: %w", cause, err)
+	}
 	if err := restoreTree(inst.Dir, snap, preserve); err != nil {
 		return fmt.Errorf("update failed: %v; restore failed: %w", cause, err)
 	}

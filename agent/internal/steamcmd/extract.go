@@ -133,9 +133,31 @@ func writeFile(path string, r io.Reader, mode os.FileMode) error {
 }
 
 func safeJoin(dest, name string) (string, error) {
+	if rejectedArchiveName(name) {
+		return "", fmt.Errorf("steamcmd archive path %q escapes the destination", name)
+	}
 	clean := filepath.Clean(name)
-	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || filepath.IsAbs(clean) {
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || filepath.IsAbs(clean) || rejectedArchiveName(clean) {
 		return "", fmt.Errorf("steamcmd archive path %q escapes the destination", name)
 	}
 	return filepath.Join(dest, clean), nil
+}
+
+func rejectedArchiveName(name string) bool {
+	if name == "" || strings.Contains(name, ":") {
+		return true
+	}
+	if strings.HasPrefix(name, `\\`) || strings.HasPrefix(name, `//`) {
+		return true
+	}
+	if vol := filepath.VolumeName(name); vol != "" {
+		return true
+	}
+	if len(name) >= 2 && name[1] == ':' {
+		c := name[0]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
+			return true
+		}
+	}
+	return false
 }

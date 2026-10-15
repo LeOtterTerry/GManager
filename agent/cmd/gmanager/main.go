@@ -7,7 +7,6 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"log"
 	"net"
@@ -84,9 +83,6 @@ func main() {
 	})
 	sup.SetStopMethod(core.StopMethod(*stopMethod))
 	steam := steamcmd.New(filepath.Join(dirData, "steamcmd"))
-	backup := func(context.Context, core.Instance) error {
-		return supervisor.ErrBackupNotConfigured
-	}
 	srv, err := api.New(api.Options{
 		Token:      token,
 		InstanceID: *instance,
@@ -101,7 +97,8 @@ func main() {
 		Logs:       logs,
 		Supervisor: sup,
 		Steam:      steam,
-		Backup:     backup,
+		// Update stays 501 until a real backup hook exists.
+		Backup: nil,
 	})
 	if err != nil {
 		stderr.Fatal(err)

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 )
@@ -31,7 +32,11 @@ func Binary(t testing.TB) string {
 			buildErr = err
 			return
 		}
-		built = filepath.Join(dir, "fakeserver")
+		name := "fakeserver"
+		if runtime.GOOS == "windows" {
+			name = "fakeserver.exe"
+		}
+		built = filepath.Join(dir, name)
 		cmd := exec.Command("go", "build", "-o", built, "./cmd/fakeserver")
 		cmd.Dir = root
 		out, err := cmd.CombinedOutput()

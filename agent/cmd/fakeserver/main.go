@@ -12,6 +12,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -79,6 +81,7 @@ type fileConfig struct {
 	ReadyDelay      string `json:"readyDelay"`
 	CrashAfter      string `json:"crashAfter"`
 	Hang            bool   `json:"hang"`
+	HangAfterRuns   int    `json:"hangAfterRuns"`
 	IgnoreStop      bool   `json:"ignoreStop"`
 	ExitBeforeReady bool   `json:"exitBeforeReady"`
 }
@@ -118,7 +121,27 @@ func loadConfig() config {
 	cfg.Hang = file.Hang
 	cfg.IgnoreStop = file.IgnoreStop
 	cfg.ExitBeforeReady = file.ExitBeforeReady
+	if file.HangAfterRuns > 0 && nextRun() >= file.HangAfterRuns {
+		cfg.Hang = true
+	}
 	return cfg
+}
+
+// nextRun counts process starts in this working directory so one
+// fakeserver.json can ready-and-crash once, then hang on the restart.
+func nextRun() int {
+	const name = ".fakeserver-runs"
+	n := 0
+	if b, err := os.ReadFile(name); err == nil {
+		if v, convErr := strconv.Atoi(strings.TrimSpace(string(b))); convErr == nil {
+			n = v
+		}
+	}
+	n++
+	if err := os.WriteFile(name, []byte(strconv.Itoa(n)), 0o644); err != nil {
+		exitf("run counter: %v", err)
+	}
+	return n
 }
 
 func exitf(format string, args ...any) {

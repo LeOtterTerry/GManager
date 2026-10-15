@@ -367,6 +367,84 @@ func TestBackupFailureSkipsSteamAndRestarts(t *testing.T) {
 	}
 }
 
+func TestAutoRestartReadyTimeoutCountsAsCrash(t *testing.T) {
+	inst := newFake(t, `{"readyDelay":"20ms","crashAfter":"80ms","hangAfterRuns":2}`)
+	pol := testPolicy()
+	pol.CrashLimit = 2
+	pol.ReadyTimeout = 250 * time.Millisecond
+	sup := New(pol, nil)
+	t.Cleanup(func() { stopNow(t, sup) })
+	if err := sup.Start(context.Background(), inst, plainsofpain.New()); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		st := sup.Status()
+		if st.State == StateCrashed && strings.Contains(st.Message, "halted") && st.PID == 0 {
+			if st.Restarts != 1 {
+				t.Fatalf("status = %+v", st)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("ready timeout was not a crash: %+v", sup.Status())
+}
+
+func TestSymlinkExeOutsideInstanceRejected(t *testing.T) {
+	inst := newFake(t, `{"readyDelay":"20ms"}`)
+	exe := filepath.Join(inst.Dir, plainsofpain.Executable)
+	outside := filepath.Join(t.TempDir(), "outside.exe")
+	if err := os.Rename(exe, outside); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, exe); err != nil {
+		t.Skip("symlink: " + err.Error())
+	}
+	sup := New(testPolicy(), nil)
+	err := sup.Start(context.Background(), inst, plainsofpain.New())
+	if err == nil || !strings.Contains(err.Error(), "outside") {
+		t.Fatalf("err = %v", err)
+	}
+	if sup.Status().PID != 0 {
+		t.Fatalf("status = %+v", sup.Status())
+	}
+}
+
+func TestRollbackChecksFreeSpace(t *testing.T) {
+	inst := newFake(t, `{"readyDelay":"20ms"}`)
+	if err := os.WriteFile(filepath.Join(inst.Dir, "other.dat"), []byte("keep-file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sup := New(testPolicy(), nil)
+	t.Cleanup(func() { stopNow(t, sup) })
+	if err := sup.Start(context.Background(), inst, plainsofpain.New()); err != nil {
+		t.Fatal(err)
+	}
+	prev := diskFree
+	diskFree = func(string) (uint64, error) { return 1, nil }
+	t.Cleanup(func() { diskFree = prev })
+	steam := &scriptedSteam{
+		err: errors.New("steam broke"),
+		before: func(dir string) {
+			if err := os.WriteFile(filepath.Join(dir, "NEWBUILD"), []byte("x"), 0o644); err != nil {
+				t.Errorf("marker: %v", err)
+			}
+		},
+	}
+	err := sup.Update(context.Background(), steam, func(context.Context, core.Instance) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "free space") {
+		t.Fatalf("err = %v", err)
+	}
+	other, readErr := os.ReadFile(filepath.Join(inst.Dir, "other.dat"))
+	if readErr != nil || string(other) != "keep-file" {
+		t.Fatalf("other.dat = %q %v", other, readErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(inst.Dir, "NEWBUILD")); statErr != nil {
+		t.Fatalf("live tree was replaced: %v", statErr)
+	}
+}
+
 func TestNilBackupFailsClosed(t *testing.T) {
 	inst := newFake(t, `{"readyDelay":"20ms"}`)
 	sup := New(testPolicy(), nil)

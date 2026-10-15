@@ -32,9 +32,11 @@ Writes return **202**:
 
 `state` is `queued`, `running`, `succeeded`, or `failed`. Unknown ids are **404**. Finished jobs are kept in memory for 15 minutes (`DefaultRetention`) and then dropped, which also returns **404**.
 
+`POST /api/v1/jobs/{id}/cancel` cancels a running job. Install and update pass that context to SteamCMD, so cancel stops the SteamCMD process. A SteamCMD run also stops on its own after 20 minutes. The response is **200** with the job, **404** when the id is unknown, and **409** `job_finished` when the job already succeeded or failed.
+
 Config saves are decided before the response (so a conflict is a synchronous **409**, not a failed job). An accepted config save is recorded as a job that is already `succeeded`. Other accepted actions are real jobs.
 
-`start` spawns the module executable and waits for the ready line. It does **not** rewrite config. A missing executable fails the job. `stop` uses the module stop method (unknown for Plains of Pain, so the process is killed) and requires `confirm: true`. `restart` stops, then starts. `install` runs SteamCMD into the instance directory and does not start the server. `update` stops, runs the backup hook, snapshots game files except `configs/server.json`, runs SteamCMD, and starts. If the update or the new build fails, the snapshot is restored and a server that was running is started again. The default backup hook fails closed until a backup implementation exists. `backup` and `restore` still record `implemented: false`.
+`start` spawns the module executable and waits for the ready line. It does **not** rewrite config. A missing executable fails the job. `stop` uses the module stop method (unknown for Plains of Pain, so the process is killed) and requires `confirm: true`. `restart` stops, then starts, and requires `confirm: true`. `install` runs SteamCMD into the instance directory and does not start the server. `update` returns **501** `not_implemented` until a backup hook is configured. When a hook exists, `update` stops, runs it, snapshots game files except `configs/server.json`, runs SteamCMD, and starts. If the update or the new build fails, the snapshot is restored only when the disk has room for it, and a server that was running is started again. `backup` and `restore` still record `implemented: false`.
 
 ## Idempotency
 
@@ -47,13 +49,13 @@ Any write accepts `Idempotency-Key` (max 200 characters).
 
 ## Destructive actions
 
-`POST /api/v1/servers/{instanceId}/stop` and `.../restore` require a JSON body with `confirm` set to `true`. Anything else is **400**:
+`POST /api/v1/servers/{instanceId}/stop`, `.../restart`, and `.../restore` require a JSON body with `confirm` set to `true`. Anything else is **400**:
 
 ```json
 {"error":"confirm_required","message":"stop requires confirm=true"}
 ```
 
-These two actions are destructive. The other writes are not.
+Stop, restart, and restore are destructive. The other writes are not. An update with no backup hook is **501**, not a failed job.
 
 ## Config revision
 

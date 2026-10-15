@@ -1,13 +1,19 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 )
+
+// ErrJobFinished means Cancel was asked to stop a job that already ended.
+var ErrJobFinished = errors.New("job finished")
 
 // DefaultRetention is how long a finished job or an idempotency record stays
 // in memory. Running jobs are kept until they finish.
@@ -39,35 +45,60 @@ type Job struct {
 	FinishedAt *time.Time      `json:"finishedAt,omitempty"`
 }
 
-// JobFunc is the body of an async job.
-type JobFunc func() (any, error)
+// JobFunc is the body of an async job. The context is cancelled when the
+// client cancels the job.
+type JobFunc func(ctx context.Context) (any, error)
 
 // JobRunner stores jobs in memory. Persistence is a later slice.
 // Finished jobs older than DefaultRetention are dropped.
 type JobRunner struct {
-	mu     sync.Mutex
-	jobs   map[string]*Job
-	inline bool
-	ttl    time.Duration
-	now    func() time.Time
+	mu      sync.Mutex
+	jobs    map[string]*Job
+	inline  bool
+	ttl     time.Duration
+	now     func() time.Time
+	cancels map[string]context.CancelFunc
 }
 
 // NewJobRunner returns an in-memory runner.
 // Inline runs the job before Start returns, which tests use for determinism.
 func NewJobRunner(inline bool) *JobRunner {
 	return &JobRunner{
-		jobs:   map[string]*Job{},
-		inline: inline,
-		ttl:    DefaultRetention,
-		now:    time.Now,
+		jobs:    map[string]*Job{},
+		inline:  inline,
+		ttl:     DefaultRetention,
+		now:     time.Now,
+		cancels: map[string]context.CancelFunc{},
 	}
 }
 
 // Start accepts work and returns the job immediately when not inline.
 func (r *JobRunner) Start(typ, instanceID string, fn JobFunc) *Job {
+	ctx, cancel := context.WithCancel(context.Background())
 	job := r.new(typ, instanceID)
-	r.launch(job, fn)
+	r.mu.Lock()
+	r.cancels[job.ID] = cancel
+	r.mu.Unlock()
+	r.launch(job, ctx, fn)
 	return r.copy(job.ID)
+}
+
+// Cancel asks a running job to stop. A missing job returns an error that
+// wraps os.ErrNotExist. A finished job returns ErrJobFinished.
+func (r *JobRunner) Cancel(id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	job, ok := r.jobs[id]
+	if !ok {
+		return os.ErrNotExist
+	}
+	if job.State == JobSucceeded || job.State == JobFailed {
+		return ErrJobFinished
+	}
+	if cancel := r.cancels[id]; cancel != nil {
+		cancel()
+	}
+	return nil
 }
 
 // Record stores a job that already finished. Config saves use this so a
@@ -106,15 +137,20 @@ func (r *JobRunner) new(typ, instanceID string) *Job {
 	return job
 }
 
-func (r *JobRunner) launch(job *Job, fn JobFunc) {
+func (r *JobRunner) launch(job *Job, ctx context.Context, fn JobFunc) {
 	run := func() {
 		r.setState(job, JobRunning)
+		defer func() {
+			r.mu.Lock()
+			delete(r.cancels, job.ID)
+			r.mu.Unlock()
+		}()
 		defer func() {
 			if rec := recover(); rec != nil {
 				r.finish(job, nil, fmt.Errorf("panic: %v", rec))
 			}
 		}()
-		result, err := fn()
+		result, err := fn(ctx)
 		r.finish(job, result, err)
 	}
 	if r.inline {
@@ -166,6 +202,7 @@ func (r *JobRunner) sweepLocked() {
 	for id, job := range r.jobs {
 		if job.FinishedAt != nil && now.Sub(*job.FinishedAt) > r.ttl {
 			delete(r.jobs, id)
+			delete(r.cancels, id)
 		}
 	}
 }

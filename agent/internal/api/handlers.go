@@ -99,7 +99,7 @@ func (s *Server) postStop(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) postRestart(w http.ResponseWriter, r *http.Request) {
-	s.acceptAction(w, r, false, "restart", s.restartWork)
+	s.acceptAction(w, r, true, "restart", s.restartWork)
 }
 
 func (s *Server) postInstall(w http.ResponseWriter, r *http.Request) {
@@ -107,32 +107,39 @@ func (s *Server) postInstall(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) postUpdate(w http.ResponseWriter, r *http.Request) {
+	if s.backup == nil {
+		writeJSON(w, http.StatusNotImplemented, errorBody{
+			Error:   "not_implemented",
+			Message: "update requires a backup hook; none is configured",
+		})
+		return
+	}
 	s.acceptAction(w, r, false, "update", s.updateWork)
 }
 
 func (s *Server) postBackup(w http.ResponseWriter, r *http.Request) {
-	s.acceptAction(w, r, false, "backup", func() (any, error) {
+	s.acceptAction(w, r, false, "backup", func(context.Context) (any, error) {
 		return map[string]any{"action": "backup", "implemented": false, "reason": "backups are not in this slice"}, nil
 	})
 }
 
 func (s *Server) postRestore(w http.ResponseWriter, r *http.Request) {
-	s.acceptAction(w, r, true, "restore", func() (any, error) {
+	s.acceptAction(w, r, true, "restore", func(context.Context) (any, error) {
 		return map[string]any{"action": "restore", "implemented": false, "reason": "restore is not in this slice"}, nil
 	})
 }
 
-func (s *Server) startWork() (any, error) {
+func (s *Server) startWork(ctx context.Context) (any, error) {
 	return s.guardConfig(func() (any, error) {
-		if err := s.sup.Start(context.Background(), s.inst, s.mod); err != nil {
+		if err := s.sup.Start(ctx, s.inst, s.mod); err != nil {
 			return nil, err
 		}
 		return s.processResult("start"), nil
 	})
 }
 
-func (s *Server) stopWork() (any, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+func (s *Server) stopWork(ctx context.Context) (any, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if err := s.sup.Stop(ctx); err != nil {
 		return nil, err
@@ -141,21 +148,21 @@ func (s *Server) stopWork() (any, error) {
 	return map[string]any{"action": "stop", "state": st.State}, nil
 }
 
-func (s *Server) restartWork() (any, error) {
+func (s *Server) restartWork(ctx context.Context) (any, error) {
 	return s.guardConfig(func() (any, error) {
-		if err := s.sup.Restart(context.Background()); err != nil {
+		if err := s.sup.Restart(ctx); err != nil {
 			return nil, err
 		}
 		return s.processResult("restart"), nil
 	})
 }
 
-func (s *Server) installWork() (any, error) {
+func (s *Server) installWork(ctx context.Context) (any, error) {
 	if s.steam == nil {
 		return nil, errors.New("steamcmd is not configured")
 	}
 	return s.guardConfig(func() (any, error) {
-		if err := s.sup.Install(context.Background(), s.steam); err != nil {
+		if err := s.sup.Install(ctx, s.steam); err != nil {
 			return nil, err
 		}
 		st := s.sup.Status()
@@ -167,18 +174,15 @@ func (s *Server) installWork() (any, error) {
 	})
 }
 
-func (s *Server) updateWork() (any, error) {
+func (s *Server) updateWork(ctx context.Context) (any, error) {
 	if s.steam == nil {
 		return nil, errors.New("steamcmd is not configured")
 	}
-	backup := s.backup
-	if backup == nil {
-		backup = func(context.Context, core.Instance) error {
-			return supervisor.ErrBackupNotConfigured
-		}
+	if s.backup == nil {
+		return nil, supervisor.ErrBackupNotConfigured
 	}
 	return s.guardConfig(func() (any, error) {
-		if err := s.sup.Update(context.Background(), s.steam, backup); err != nil {
+		if err := s.sup.Update(ctx, s.steam, s.backup); err != nil {
 			return nil, err
 		}
 		return s.processResult("update"), nil
@@ -342,7 +346,29 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, job)
 }
 
-func (s *Server) acceptAction(w http.ResponseWriter, r *http.Request, destructive bool, action string, work func() (any, error)) {
+func (s *Server) postCancelJob(w http.ResponseWriter, r *http.Request) {
+	err := s.jobs.Cancel(r.PathValue("id"))
+	if errors.Is(err, os.ErrNotExist) {
+		writeJSON(w, http.StatusNotFound, errorBody{Error: "not_found", Message: "unknown job"})
+		return
+	}
+	if errors.Is(err, ErrJobFinished) {
+		writeJSON(w, http.StatusConflict, errorBody{Error: "job_finished", Message: "job already finished"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody{Error: "internal", Message: "could not cancel job"})
+		return
+	}
+	job, ok := s.jobs.Get(r.PathValue("id"))
+	if !ok {
+		writeJSON(w, http.StatusNotFound, errorBody{Error: "not_found", Message: "unknown job"})
+		return
+	}
+	writeJSON(w, http.StatusOK, job)
+}
+
+func (s *Server) acceptAction(w http.ResponseWriter, r *http.Request, destructive bool, action string, work func(context.Context) (any, error)) {
 	if !s.knownInstance(w, r) {
 		return
 	}

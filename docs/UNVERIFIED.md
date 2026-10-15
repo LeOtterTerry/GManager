@@ -7,9 +7,9 @@ Someone with a real install needs to confirm the rows below. Until then the agen
 | Item | What is unverified | Current behavior |
 |---|---|---|
 | Default save path | Where the dedicated server writes saves when `userdir` is empty. | `SavePaths` returns an error unless `userdir` is set. No default path is invented. |
-| Clean stop on Windows | Whether a window message, stdin command, or other request stops `PlainsOfPain.exe` without killing it. | The module stop method is unknown. Stop kills the process (`TerminateProcess` on Windows, `SIGKILL` on Unix). That can lose data. |
+| Clean stop on Windows | Whether a window message, stdin command, or other request stops `PlainsOfPain.exe` without killing it. | The module stop method is unknown. Stop kills the process (`TerminateJobObject` on Windows, `SIGKILL` on Unix). That can lose data. |
 | `SIGTERM` / `--stop-method interrupt` | Whether an interrupt is a clean Plains of Pain stop. | Not used unless the operator sets `--stop-method interrupt`. On Unix that sends `SIGTERM` to the process group. On Windows the interrupt is refused and, when the module allows it, the process is killed. This is not a confirmed game stop. |
-| Windows Job Object | Whether a job object is the right way to contain the dedicated server and its children. | Not created. Shipping an untested job object would pretend a Windows behavior we have not seen. |
+| Windows Job Object | Whether a job object contains `PlainsOfPain.exe` and every child it starts. | The fakeserver is created suspended, assigned to a job with `KILL_ON_JOB_CLOSE`, resumed, and killed with `TerminateJobObject`. Containing the real dedicated server is still unverified. |
 | `-cc` | Whether `-cc` works on Windows. | Omitted unless `--console-commands` is set. Default is off. |
 | `adminAccountIDs` format | The real shape of an admin id. | Preserved verbatim. Not type-checked. Fixtures use `STEAM64_PLACEHOLDER`, never a real Steam ID. |
 | `worldId`, `mapId`, `seed`, `ttr` | JSON types. | Preserved verbatim. Types are not guessed. |

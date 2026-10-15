@@ -11,6 +11,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -100,7 +102,11 @@ type Supervisor struct {
 	updating      bool
 	cancelBackoff chan struct{}
 	gen           int
+	killFn        func() error
+	closeFn       func() error
 }
+
+const ioWaitDelay = 5 * time.Second
 
 // New returns a supervisor. log may be nil.
 func New(policy Policy, log func(string)) *Supervisor {
@@ -184,6 +190,7 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 	s.stopReq = true
 	s.cancelRestartLocked()
 	cmd := s.cmd
+	killFn := s.killFn
 	method, timeout, thenKill := s.stopChoiceLocked()
 	if cmd == nil || cmd.Process == nil {
 		s.markStoppedLocked()
@@ -206,7 +213,7 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 	} else if !thenKill {
 		return errors.New("no stop method is configured")
 	}
-	if err := killProcess(cmd); err != nil {
+	if err := terminateProcess(cmd, killFn); err != nil {
 		return err
 	}
 	if !s.waitExit(ctx, timeout) {
@@ -289,19 +296,16 @@ func (s *Supervisor) spawnLocked() (chan struct{}, error) {
 		return nil, errors.New("instance directory is required")
 	}
 	exe := s.mod.ExePath(s.inst)
-	info, err := os.Stat(exe)
-	if err != nil || info.IsDir() {
+	resolved, err := resolveContained(s.inst.Dir, exe)
+	if err != nil {
 		if s.state != StateUpdating {
 			s.state = StateStopped
 		}
-		if err != nil {
-			return nil, fmt.Errorf("server executable: %w", err)
-		}
-		return nil, fmt.Errorf("server executable: %s is a directory", exe)
+		return nil, err
 	}
-	cmd := exec.Command(exe, s.mod.LaunchArgs(s.inst)...)
+	cmd := exec.Command(resolved, s.mod.LaunchArgs(s.inst)...)
 	cmd.Dir = s.inst.Dir
-	prepareCommand(cmd)
+	cmd.WaitDelay = ioWaitDelay
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -310,13 +314,21 @@ func (s *Supervisor) spawnLocked() (chan struct{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := cmd.Start(); err != nil {
+	killFn, closeFn, err := startProcess(cmd)
+	if err != nil {
 		if s.state != StateUpdating {
 			s.state = StateCrashed
 		}
 		s.message = err.Error()
 		return nil, err
 	}
+	if s.closeFn != nil {
+		if closeErr := s.closeFn(); closeErr != nil && s.log != nil {
+			s.log("close previous process: " + closeErr.Error())
+		}
+	}
+	s.killFn = killFn
+	s.closeFn = closeFn
 	s.cancelBackoff = nil
 	s.cmd = cmd
 	s.pid = cmd.Process.Pid
@@ -336,19 +348,13 @@ func (s *Supervisor) spawnLocked() (chan struct{}, error) {
 }
 
 func (s *Supervisor) watch(stdout, stderr io.Reader, cmd *exec.Cmd, gen int) {
-	var wg sync.WaitGroup
-	wg.Add(2)
+	go s.scan(stdout, gen)
+	go s.scan(stderr, gen)
+	done := make(chan error, 1)
 	go func() {
-		defer wg.Done()
-		s.scan(stdout, gen)
+		done <- cmd.Wait()
 	}()
-	go func() {
-		defer wg.Done()
-		s.scan(stderr, gen)
-	}()
-	wg.Wait()
-	waitErr := cmd.Wait()
-	s.onExit(gen, waitErr)
+	s.onExit(gen, <-done)
 }
 
 func (s *Supervisor) scan(r io.Reader, gen int) {
@@ -369,7 +375,7 @@ func (s *Supervisor) observe(line string, gen int) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if gen != s.gen || s.mod == nil {
+	if gen != s.gen || s.mod == nil || s.pid == 0 {
 		return
 	}
 	if !core.LineReady(s.mod, line) {
@@ -388,6 +394,13 @@ func (s *Supervisor) onExit(gen int, waitErr error) {
 	defer s.mu.Unlock()
 	if gen != s.gen {
 		return
+	}
+	if s.closeFn != nil {
+		if err := s.closeFn(); err != nil && s.log != nil {
+			s.log("close process: " + err.Error())
+		}
+		s.closeFn = nil
+		s.killFn = nil
 	}
 	s.cmd = nil
 	s.pid = 0
@@ -437,6 +450,8 @@ func (s *Supervisor) restartAfter(delay time.Duration, cancel chan struct{}, gen
 		return
 	}
 	release, err := s.spawnLocked()
+	genNow := s.gen
+	timeout := s.policy.ReadyTimeout
 	s.mu.Unlock()
 	if release != nil {
 		close(release)
@@ -449,6 +464,13 @@ func (s *Supervisor) restartAfter(delay time.Duration, cancel chan struct{}, gen
 			s.message = err.Error()
 		}
 		s.mu.Unlock()
+		return
+	}
+	readyCtx, stopWait := context.WithTimeout(context.Background(), timeout)
+	err = s.waitReady(readyCtx)
+	stopWait()
+	if err != nil {
+		s.noteReadyTimeout(genNow)
 	}
 }
 
@@ -475,6 +497,54 @@ func (s *Supervisor) waitReady(ctx context.Context) error {
 			return fmt.Errorf("timed out waiting for ready: %w", ctx.Err())
 		case <-ticker.C:
 		}
+	}
+}
+
+func terminateProcess(cmd *exec.Cmd, killFn func() error) error {
+	if killFn != nil {
+		return killFn()
+	}
+	return killProcess(cmd)
+}
+
+func resolveContained(root, exe string) (string, error) {
+	info, err := os.Stat(exe)
+	if err != nil || info.IsDir() {
+		if err != nil {
+			return "", fmt.Errorf("server executable: %w", err)
+		}
+		return "", fmt.Errorf("server executable: %s is a directory", exe)
+	}
+	rootResolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("server directory: %w", err)
+	}
+	exeResolved, err := filepath.EvalSymlinks(exe)
+	if err != nil {
+		return "", fmt.Errorf("server executable: %w", err)
+	}
+	rel, err := filepath.Rel(rootResolved, exeResolved)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("server executable %s is outside %s", exe, root)
+	}
+	return exeResolved, nil
+}
+
+func (s *Supervisor) noteReadyTimeout(gen int) {
+	s.mu.Lock()
+	if s.gen != gen || s.ready || s.stopReq {
+		s.mu.Unlock()
+		return
+	}
+	cmd := s.cmd
+	killFn := s.killFn
+	alive := s.pid != 0
+	s.mu.Unlock()
+	if !alive {
+		return
+	}
+	if err := terminateProcess(cmd, killFn); err != nil && s.log != nil {
+		s.log("kill after ready timeout: " + err.Error())
 	}
 }
 
