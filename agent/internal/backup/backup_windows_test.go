@@ -76,6 +76,13 @@ func TestWindowsRestoreLockedSaveFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() {
+		if h != 0 {
+			if err := windows.CloseHandle(h); err != nil {
+				t.Errorf("close lock: %v", err)
+			}
+		}
+	}()
 	done := make(chan error, 1)
 	go func() {
 		done <- store.Restore(context.Background(), entry.ID, inst, mod)
@@ -88,6 +95,7 @@ func TestWindowsRestoreLockedSaveFile(t *testing.T) {
 	if err := windows.CloseHandle(h); err != nil {
 		t.Fatal(err)
 	}
+	h = 0
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}

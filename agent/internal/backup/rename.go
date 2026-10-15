@@ -2,32 +2,40 @@ package backup
 
 import "time"
 
-// sharingRetryFor is how long a Windows sharing violation is retried.
-// Access denied fails after a short second attempt instead of waiting this out.
-const sharingRetryFor = 8 * time.Second
+const (
+	// sharingRetryFor is how long a Windows sharing violation is retried.
+	sharingRetryFor = 8 * time.Second
+	// accessRetryFor bounds access-denied retries. Windows returns that error,
+	// not a sharing violation, when the directory being renamed contains an
+	// open file. A persistent denial is returned without waiting out the
+	// sharing deadline.
+	accessRetryFor = time.Second
+)
 
 // renameRetry retries sharing-violation errors for several seconds.
-// A persistent access-denied error is returned quickly. Other errors return
+// Access denied is retried only for a short window. Other errors return
 // on the first attempt.
 func renameRetry(oldpath, newpath string) error {
-	deadline := time.Now().Add(sharingRetryFor)
+	sharingDeadline := time.Now().Add(sharingRetryFor)
+	accessDeadline := time.Now().Add(accessRetryFor)
 	delay := 20 * time.Millisecond
-	denied := 0
 	var err error
 	for {
 		err = renameOnce(oldpath, newpath)
 		if err == nil {
 			return nil
 		}
-		if isAccessDenied(err) {
-			denied++
-			if denied >= 2 {
+		now := time.Now()
+		switch {
+		case isAccessDenied(err):
+			if !now.Before(accessDeadline) {
 				return err
 			}
-			time.Sleep(50 * time.Millisecond)
-			continue
-		}
-		if !isSharingViolation(err) || !time.Now().Before(deadline) {
+		case isSharingViolation(err):
+			if !now.Before(sharingDeadline) {
+				return err
+			}
+		default:
 			return err
 		}
 		time.Sleep(delay)
