@@ -138,8 +138,7 @@ type Store struct {
 
 	keyMu          sync.Mutex
 	loadedKey      []byte
-	activeInstance string
-	activeRestore  string
+	activeRestores map[string]string
 	// mu guards quarantine, discard, release, sign, and prune.
 	mu sync.Mutex
 	// swapFail, when set, runs before each live swap during restore.
@@ -1140,10 +1139,23 @@ func writeKeyFile(path string, b []byte) error {
 }
 
 type keyMeta struct {
-	Created   time.Time `json:"created"`
-	Instance  string    `json:"instance,omitempty"`
-	RestoreID string    `json:"restoreID,omitempty"`
-	HMAC      string    `json:"hmac,omitempty"`
+	Created time.Time `json:"created"`
+	// Instance and RestoreID are the legacy single-instance record. New
+	// metadata stores one restore id per instance in Restores.
+	Instance  string            `json:"instance,omitempty"`
+	RestoreID string            `json:"restoreID,omitempty"`
+	Restores  map[string]string `json:"restores,omitempty"`
+	HMAC      string            `json:"hmac,omitempty"`
+}
+
+func (m keyMeta) idFor(instance string) (string, bool) {
+	if id := m.Restores[instance]; id != "" {
+		return id, true
+	}
+	if len(m.Restores) == 0 && m.Instance == instance && m.RestoreID != "" {
+		return m.RestoreID, true
+	}
+	return "", false
 }
 
 func (s *Store) metaPath() string {
@@ -1299,15 +1311,24 @@ func (s *Store) armRestore(instance, restoreID string) error {
 				return err
 			}
 		}
-		meta.Instance = instance
-		meta.RestoreID = restoreID
+		if meta.Restores == nil {
+			meta.Restores = map[string]string{}
+		}
+		if meta.Instance != "" && meta.RestoreID != "" && meta.Restores[meta.Instance] == "" {
+			meta.Restores[meta.Instance] = meta.RestoreID
+		}
+		meta.Instance = ""
+		meta.RestoreID = ""
+		meta.Restores[instance] = restoreID
 		if err := s.writeKeyMeta(meta, key); err != nil {
 			return err
 		}
 	}
 	s.keyMu.Lock()
-	s.activeInstance = instance
-	s.activeRestore = restoreID
+	if s.activeRestores == nil {
+		s.activeRestores = map[string]string{}
+	}
+	s.activeRestores[instance] = restoreID
 	s.keyMu.Unlock()
 	return nil
 }
@@ -1329,17 +1350,19 @@ func (s *Store) expectedRestore(instance string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if meta.Instance != instance || meta.RestoreID == "" {
+		id, ok := meta.idFor(instance)
+		if !ok {
 			return "", fmt.Errorf("%w: restore id does not match", ErrJournal)
 		}
-		return meta.RestoreID, nil
+		return id, nil
 	}
 	s.keyMu.Lock()
 	defer s.keyMu.Unlock()
-	if s.activeInstance != instance || s.activeRestore == "" {
+	id := s.activeRestores[instance]
+	if id == "" {
 		return "", fmt.Errorf("%w: restore id does not match", ErrJournal)
 	}
-	return s.activeRestore, nil
+	return id, nil
 }
 
 type quarFile struct {

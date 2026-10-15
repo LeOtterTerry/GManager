@@ -136,7 +136,9 @@ func (s *Store) finishCommit(err error, staged *stagedSet, safety *archive, safe
 	if cerr != nil {
 		return errors.Join(err, cerr)
 	}
-	if committed {
+	// The journal is removed before the restore id rotates. If that remove
+	// already happened, the swaps are done and must not be undone.
+	if committed || (staged != nil && staged.dirty && s.journalMissing(instanceID)) {
 		return fmt.Errorf("restored; cleanup failed: %w", err)
 	}
 	undoErr := staged.undo()
@@ -148,11 +150,10 @@ func (s *Store) finishCommit(err error, staged *stagedSet, safety *archive, safe
 		if dirErr != nil {
 			return errors.Join(err, dirErr)
 		}
-		if rotErr := s.rotateRestoreID(instanceID); rotErr != nil {
-			return errors.Join(err, rotErr)
-		}
-		if rmErr := removeJournal(dir, instanceID); rmErr != nil {
-			return errors.Join(err, rmErr)
+		if dropErr := finishJournalFile(dir, instanceID, func() error {
+			return s.rotateRestoreID(instanceID)
+		}); dropErr != nil {
+			return errors.Join(err, dropErr)
 		}
 		return err
 	}

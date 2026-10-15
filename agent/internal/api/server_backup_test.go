@@ -579,6 +579,54 @@ func TestDiscardHoldAPI(t *testing.T) {
 	}
 }
 
+func TestJournalAPI(t *testing.T) {
+	save := t.TempDir()
+	archives := testArchives(t, 5)
+	_, httpSrv, cfgPath := newAPIOpt(t, 50, Options{Archives: archives})
+	writeCfg(t, cfgPath, configJSON(t, save, "kept"))
+	path := filepath.Join(archives.JournalDir, ".gmanager-restore-journal-default")
+	status, body, _ := do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/journal", "test-token", `{}`, nil)
+	if status != http.StatusNotFound || !bytes.Contains(body, []byte("not_found")) {
+		t.Fatalf("missing preview = %d %s", status, body)
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/journal", "test-token", `{"confirm":true}`, nil)
+	if status != http.StatusBadRequest || !bytes.Contains(body, []byte("op_required")) {
+		t.Fatalf("op = %d %s", status, body)
+	}
+	if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/journal", "test-token", `{}`, nil)
+	if status != http.StatusOK || !bytes.Contains(body, []byte(`"action":"journal-preview"`)) || !bytes.Contains(body, []byte(`"authOK":false`)) {
+		t.Fatalf("preview = %d %s", status, body)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal("preview removed the journal")
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/journal", "test-token", `{"confirm":true,"op":"sideways"}`, nil)
+	if status != http.StatusBadRequest || !bytes.Contains(body, []byte("invalid_op")) {
+		t.Fatalf("bad op = %d %s", status, body)
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/journal", "test-token", `{"confirm":true,"op":"rollback"}`, nil)
+	if status != http.StatusConflict || !bytes.Contains(body, []byte(`"journal"`)) {
+		t.Fatalf("rollback = %d %s", status, body)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal("failed rollback removed the journal")
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/journal", "test-token", `{"confirm":true,"op":"discard"}`, nil)
+	if status != http.StatusOK || !bytes.Contains(body, []byte(`"action":"journal-discard"`)) {
+		t.Fatalf("discard = %d %s", status, body)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("discarded journal err = %v", err)
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/journal", "test-token", `{"confirm":true,"op":"discard"}`, nil)
+	if status != http.StatusNotFound {
+		t.Fatalf("second discard = %d %s", status, body)
+	}
+}
+
 func TestUserDirOverrideWinsOverConfig(t *testing.T) {
 	flagDir := t.TempDir()
 	configDir := t.TempDir()

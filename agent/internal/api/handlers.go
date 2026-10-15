@@ -366,6 +366,86 @@ func (s *Server) postDiscardHold(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) postJournal(w http.ResponseWriter, r *http.Request) {
+	if !s.knownInstance(w, r) {
+		return
+	}
+	body, err := readBody(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: "invalid_body", Message: bodyReadMessage(err)})
+		return
+	}
+	s.accept(w, r, body, func() decision {
+		ok, err := confirmed(body)
+		if err != nil {
+			return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "invalid_body", Message: "body must be JSON"}}
+		}
+		if s.archives == nil {
+			return decision{Status: http.StatusNotImplemented, Body: errorBody{
+				Error:   "not_implemented",
+				Message: "backup directory is not configured",
+			}}
+		}
+		inst := s.withSaveDir(s.inst)
+		if !ok {
+			view, err := s.archives.PreviewJournal(inst, s.mod)
+			if err != nil {
+				return journalDecision(err)
+			}
+			return decision{Status: http.StatusOK, Body: struct {
+				Action string `json:"action"`
+				backup.JournalView
+			}{Action: "journal-preview", JournalView: view}}
+		}
+		op, err := journalOp(body)
+		if err != nil {
+			return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "invalid_body", Message: "body must be JSON"}}
+		}
+		switch op {
+		case "rollback":
+			if err := s.archives.RollbackJournal(inst, s.mod); err != nil {
+				return journalDecision(err)
+			}
+			return decision{Status: http.StatusOK, Body: map[string]any{"action": "journal-rollback"}}
+		case "discard":
+			if err := s.archives.DiscardJournal(inst); err != nil {
+				return journalDecision(err)
+			}
+			return decision{Status: http.StatusOK, Body: map[string]any{"action": "journal-discard"}}
+		case "":
+			return decision{Status: http.StatusBadRequest, Body: errorBody{
+				Error:   "op_required",
+				Message: "journal requires op rollback or discard",
+			}}
+		default:
+			return decision{Status: http.StatusBadRequest, Body: errorBody{
+				Error:   "invalid_op",
+				Message: "journal op must be rollback or discard",
+			}}
+		}
+	})
+}
+
+func journalDecision(err error) decision {
+	if errors.Is(err, backup.ErrNotFound) {
+		return decision{Status: http.StatusNotFound, Body: errorBody{Error: "not_found", Message: "no restore journal"}}
+	}
+	if errors.Is(err, backup.ErrJournal) || errors.Is(err, backup.ErrJournalAuth) || errors.Is(err, backup.ErrMissingHold) {
+		return decision{Status: http.StatusConflict, Body: errorBody{Error: "journal", Message: err.Error()}}
+	}
+	return decision{Status: http.StatusInternalServerError, Body: errorBody{Error: "internal", Message: "could not update restore journal"}}
+}
+
+func journalOp(body []byte) (string, error) {
+	var payload struct {
+		Op string `json:"op"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", err
+	}
+	return payload.Op, nil
+}
+
 func (s *Server) postReleaseBackup(w http.ResponseWriter, r *http.Request) {
 	s.postArchiveConfirm(w, r, "release", "release requires confirm=true", "release requires a backup id", func(id string) error {
 		return s.archives.Release(id)

@@ -1369,6 +1369,695 @@ func TestCommitRevalidationFailure(t *testing.T) {
 	}
 }
 
+func TestStaleFinishedJournalIsRemoved(t *testing.T) {
+	inst, mod, save := newWorld(t)
+	writeSave(t, save, "world.dat", "live")
+	data := t.TempDir()
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), JournalDir: data, Keep: 5, Key: testKey()}
+	if err := store.armRestore("default", "ffffffffffffffffffffffffffffffff"); err != nil {
+		t.Fatal(err)
+	}
+	staleID := "abc123abc123abc123abc123abc123ab"
+	missingHold := filepath.Join(filepath.Dir(save), ".gmanager-hold-"+filepath.Base(save))
+	finished := journalFile{
+		Version:   journalVersion,
+		State:     journalCommitted,
+		Instance:  "default",
+		RestoreID: staleID,
+		Targets:   []journalTarget{{Dest: save, Hold: missingHold, Dir: true, Swapped: true}},
+	}
+	if err := writeJournal(data, "default", finished, testKey()); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.expectedRestore("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Recover(inst, mod); err != nil {
+		t.Fatalf("finished stale = %v", err)
+	}
+	if _, err := os.Stat(jpath(t, data, "default")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("finished journal was kept")
+	}
+	if got := readSave(t, save, "world.dat"); got != "live" {
+		t.Fatalf("world = %q", got)
+	}
+	after, err := store.expectedRestore("default")
+	if err != nil || after != before {
+		t.Fatalf("finished removal rotated the id: %q %q %v", before, after, err)
+	}
+
+	hold := missingHold
+	if err := os.MkdirAll(hold, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hold, "world.dat"), []byte("held"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	withHold := finished
+	if err := writeJournal(data, "default", withHold, testKey()); err != nil {
+		t.Fatal(err)
+	}
+	err = store.Recover(inst, mod)
+	if !errors.Is(err, ErrJournal) {
+		t.Fatalf("stale with hold = %v", err)
+	}
+	if _, err := os.Stat(hold); err != nil {
+		t.Fatal("stale hold was removed")
+	}
+	if _, err := os.Stat(jpath(t, data, "default")); err != nil {
+		t.Fatal("stale journal with a hold was removed")
+	}
+	if err := os.RemoveAll(hold); err != nil {
+		t.Fatal(err)
+	}
+
+	pending := finished
+	pending.State = journalPending
+	if err := writeJournal(data, "default", pending, testKey()); err != nil {
+		t.Fatal(err)
+	}
+	err = store.Recover(inst, mod)
+	if !errors.Is(err, ErrJournal) {
+		t.Fatalf("stale pending = %v", err)
+	}
+	if _, err := os.Stat(jpath(t, data, "default")); err != nil {
+		t.Fatal("stale pending journal was removed")
+	}
+	if got := readSave(t, save, "world.dat"); got != "live" {
+		t.Fatalf("pending world = %q", got)
+	}
+}
+
+func TestJournalOperatorRollbackAndDiscard(t *testing.T) {
+	inst, mod, save := newWorld(t)
+	writeSave(t, save, "world.dat", "live")
+	parent := filepath.Dir(save)
+	hold := filepath.Join(parent, ".gmanager-hold-"+filepath.Base(save))
+	if err := os.MkdirAll(hold, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hold, "world.dat"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeSave(t, save, "world.dat", "new")
+	data := t.TempDir()
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), JournalDir: data, Keep: 5, Key: testKey()}
+	if err := store.armRestore("default", "ffffffffffffffffffffffffffffffff"); err != nil {
+		t.Fatal(err)
+	}
+	pending := journalFile{
+		Version:   journalVersion,
+		State:     journalPending,
+		Instance:  "default",
+		RestoreID: "abc123abc123abc123abc123abc123ab",
+		Targets:   []journalTarget{{Dest: save, Hold: hold, Dir: true, Swapped: true}},
+	}
+	if err := writeJournal(data, "default", pending, testKey()); err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.PreviewJournal(inst, mod)
+	if err != nil || !view.AuthOK || view.IDMatches || view.State != journalPending || !view.AllowlistOK {
+		t.Fatalf("preview = %+v %v", view, err)
+	}
+	if len(view.Targets) != 1 || !view.Targets[0].HoldPresent || !view.Targets[0].Swapped {
+		t.Fatalf("targets = %+v", view.Targets)
+	}
+	if err := store.RollbackJournal(inst, mod); err != nil {
+		t.Fatal(err)
+	}
+	if got := readSave(t, save, "world.dat"); got != "old" {
+		t.Fatalf("rolled back world = %q", got)
+	}
+	if _, err := os.Stat(jpath(t, data, "default")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("rolled-back journal was kept")
+	}
+	if _, err := store.PreviewJournal(inst, mod); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("preview after rollback = %v", err)
+	}
+
+	writeSave(t, save, "world.dat", "half")
+	if err := store.armRestore("default", pending.RestoreID); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJournal(data, "default", pending, testKey()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RollbackJournal(inst, mod); !errors.Is(err, ErrMissingHold) {
+		t.Fatalf("anomaly rollback = %v", err)
+	}
+	if _, err := os.Stat(jpath(t, data, "default")); err != nil {
+		t.Fatal("anomaly journal was removed")
+	}
+	if got := readSave(t, save, "world.dat"); got != "half" {
+		t.Fatalf("discard-not-yet world = %q", got)
+	}
+	if err := store.DiscardJournal(inst); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(jpath(t, data, "default")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("discarded journal was kept")
+	}
+	if got := readSave(t, save, "world.dat"); got != "half" {
+		t.Fatalf("discarded world = %q", got)
+	}
+	if err := store.Recover(inst, mod); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DiscardJournal(inst); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("second discard = %v", err)
+	}
+}
+
+func TestRestoreIDIsPerInstance(t *testing.T) {
+	inst, mod, save := newWorld(t)
+	writeSave(t, save, "world.dat", "old")
+	parent := filepath.Dir(save)
+	hold := filepath.Join(parent, ".gmanager-hold-"+filepath.Base(save))
+	if err := os.Rename(save, hold); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(save, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeSave(t, save, "world.dat", "new")
+	keyPath := filepath.Join(t.TempDir(), "backup.hmac")
+	if err := os.WriteFile(keyPath, testKey(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	data := t.TempDir()
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), JournalDir: data, Keep: 5, Key: testKey(), KeyPath: keyPath}
+	legacy := keyMeta{Created: time.Now().UTC(), Instance: "default", RestoreID: "abc123abc123abc123abc123abc123ab"}
+	if err := store.writeKeyMeta(legacy, testKey()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.expectedRestore("default")
+	if err != nil || got != legacy.RestoreID {
+		t.Fatalf("legacy id = %q %v", got, err)
+	}
+	otherID := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	if err := store.armRestore("other", otherID); err != nil {
+		t.Fatal(err)
+	}
+	got, err = store.expectedRestore("default")
+	if err != nil || got != legacy.RestoreID {
+		t.Fatalf("default after other = %q %v", got, err)
+	}
+	got, err = store.expectedRestore("other")
+	if err != nil || got != otherID {
+		t.Fatalf("other = %q %v", got, err)
+	}
+	meta, err := store.loadKeyMeta()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Instance != "" || meta.RestoreID != "" || meta.Restores["default"] != legacy.RestoreID || meta.Restores["other"] != otherID {
+		t.Fatalf("meta = %+v", meta)
+	}
+	pending := journalFile{
+		Version:   journalVersion,
+		State:     journalPending,
+		Instance:  "default",
+		RestoreID: legacy.RestoreID,
+		Targets:   []journalTarget{{Dest: save, Hold: hold, Dir: true, Swapped: true}},
+	}
+	if err := writeJournal(data, "default", pending, testKey()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Recover(inst, mod); err != nil {
+		t.Fatal(err)
+	}
+	if got := readSave(t, save, "world.dat"); got != "old" {
+		t.Fatalf("world = %q", got)
+	}
+	got, err = store.expectedRestore("other")
+	if err != nil || got != otherID {
+		t.Fatalf("other after recover = %q %v", got, err)
+	}
+
+	mem := &Store{Dir: store.Dir, JournalDir: t.TempDir(), Keep: 5, Key: testKey()}
+	if err := mem.armRestore("default", "cccccccccccccccccccccccccccccccc"); err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.armRestore("other", "dddddddddddddddddddddddddddddddd"); err != nil {
+		t.Fatal(err)
+	}
+	got, err = mem.expectedRestore("default")
+	if err != nil || got != "cccccccccccccccccccccccccccccccc" {
+		t.Fatalf("memory default = %q %v", got, err)
+	}
+	got, err = mem.expectedRestore("other")
+	if err != nil || got != "dddddddddddddddddddddddddddddddd" {
+		t.Fatalf("memory other = %q %v", got, err)
+	}
+}
+
+func TestMarkSwappedFailureRollsBack(t *testing.T) {
+	inst, mod, save := newWorld(t)
+	writeSave(t, save, "world.dat", "alpha")
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), JournalDir: t.TempDir(), Keep: 5, Key: testKey()}
+	entry, err := store.Create(context.Background(), Request{Instance: inst, Module: mod, Kind: KindManual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSave(t, save, "world.dat", "live")
+	markErr := errors.New("mark swapped failed")
+	hookMarkSwapped = func() error { return markErr }
+	t.Cleanup(func() { hookMarkSwapped = nil })
+	err = store.Restore(context.Background(), entry.ID, inst, mod)
+	if !errors.Is(err, markErr) || strings.Contains(err.Error(), "restored; cleanup failed") {
+		t.Fatalf("restore = %v", err)
+	}
+	if got := readSave(t, save, "world.dat"); got != "live" {
+		t.Fatalf("world = %q", got)
+	}
+	if _, err := os.Stat(jpath(t, store.JournalDir, "default")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("journal was kept")
+	}
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(save), ".gmanager-hold-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("holds = %v", matches)
+	}
+	hookMarkSwapped = nil
+	if err := store.Restore(context.Background(), entry.ID, inst, mod); err != nil {
+		t.Fatal(err)
+	}
+	if got := readSave(t, save, "world.dat"); got != "alpha" {
+		t.Fatalf("retried world = %q", got)
+	}
+}
+
+func TestHoldRemoveDoesNotFollowParentSymlink(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "real")
+	holdName := ".gmanager-hold-World"
+	hold := filepath.Join(real, holdName)
+	if err := os.MkdirAll(hold, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hold, "world.dat"), []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(real, "secret.dat")
+	if err := os.WriteFile(secret, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	inside := filepath.Join(hold, "link.dat")
+	if err := os.Symlink(secret, inside); err != nil {
+		t.Logf("inner symlink not tested: %v", err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Logf("parent symlink not tested: %v", err)
+	} else if err := removeAllNoFollow(filepath.Join(link, holdName)); !errors.Is(err, ErrJournal) {
+		t.Fatalf("parent symlink = %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(hold, "world.dat")); err != nil || string(got) != "keep" {
+		t.Fatalf("followed parent = %q %v", got, err)
+	}
+	if err := removeAllNoFollow(hold); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(hold); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("hold was kept")
+	}
+	if got, err := os.ReadFile(secret); err != nil || string(got) != "secret" {
+		t.Fatalf("inner target = %q %v", got, err)
+	}
+}
+
+func TestJournalRemoveAndRotateBoundaries(t *testing.T) {
+	t.Run("commit before remove", func(t *testing.T) {
+		inst, mod, save, store, entry := restorePair(t)
+		clearJournalHooks(t)
+		hookJournalRemove = func() error { return errors.New("crash before remove") }
+		err := store.Restore(context.Background(), entry.ID, inst, mod)
+		if err == nil || !strings.Contains(err.Error(), "restored; cleanup failed") {
+			t.Fatalf("restore = %v", err)
+		}
+		if got := readSave(t, save, "world.dat"); got != "alpha" {
+			t.Fatalf("world = %q", got)
+		}
+		j, err := readJournal(store.JournalDir, "default", testKey())
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := store.expectedRestore("default")
+		if err != nil || got != j.RestoreID {
+			t.Fatalf("id rotated before remove: journal %q expected %q %v", j.RestoreID, got, err)
+		}
+		hookJournalRemove = nil
+		if err := store.Recover(inst, mod); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(jpath(t, store.JournalDir, "default")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatal("journal was kept")
+		}
+		after, err := store.expectedRestore("default")
+		if err != nil || after == got {
+			t.Fatalf("cleanup id = %q %q %v", got, after, err)
+		}
+		if got := readSave(t, save, "world.dat"); got != "alpha" {
+			t.Fatalf("world after cleanup = %q", got)
+		}
+	})
+	t.Run("commit after remove", func(t *testing.T) {
+		inst, mod, save, store, entry := restorePair(t)
+		clearJournalHooks(t)
+		var saved []byte
+		hookJournalRemove = func() error {
+			b, err := os.ReadFile(jpath(t, store.JournalDir, "default"))
+			if err != nil {
+				return err
+			}
+			saved = append([]byte(nil), b...)
+			return nil
+		}
+		hookAfterJournalRemove = func() error { return errors.New("crash before rotate") }
+		err := store.Restore(context.Background(), entry.ID, inst, mod)
+		if err == nil || !strings.Contains(err.Error(), "restored; cleanup failed") {
+			t.Fatalf("restore = %v", err)
+		}
+		if _, err := os.Stat(jpath(t, store.JournalDir, "default")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatal("journal was kept")
+		}
+		if got := readSave(t, save, "world.dat"); got != "alpha" {
+			t.Fatalf("world = %q", got)
+		}
+		var planted journalFile
+		if err := json.Unmarshal(saved, &planted); err != nil {
+			t.Fatal(err)
+		}
+		got, err := store.expectedRestore("default")
+		if err != nil || got != planted.RestoreID {
+			t.Fatalf("id rotated after remove failed: journal %q expected %q %v", planted.RestoreID, got, err)
+		}
+		if err := os.WriteFile(jpath(t, store.JournalDir, "default"), saved, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		hookJournalRemove = nil
+		hookAfterJournalRemove = nil
+		if err := store.Recover(inst, mod); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(jpath(t, store.JournalDir, "default")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatal("replayed journal was kept")
+		}
+		after, err := store.expectedRestore("default")
+		if err != nil || after == got {
+			t.Fatalf("replay cleanup id = %q %q %v", got, after, err)
+		}
+	})
+	t.Run("pending rollback before remove", func(t *testing.T) {
+		inst, mod, save, store := swappedPending(t)
+		clearJournalHooks(t)
+		hookJournalRemove = func() error { return errors.New("crash before remove") }
+		err := store.Recover(inst, mod)
+		if err == nil {
+			t.Fatal("expected crash")
+		}
+		if got := readSave(t, save, "world.dat"); got != "old-save" {
+			t.Fatalf("world = %q", got)
+		}
+		if _, err := os.Stat(jpath(t, store.JournalDir, "default")); err != nil {
+			t.Fatal(err)
+		}
+		hookJournalRemove = nil
+		if err := store.Recover(inst, mod); !errors.Is(err, ErrMissingHold) {
+			t.Fatalf("second = %v", err)
+		}
+		if err := store.DiscardJournal(inst); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Recover(inst, mod); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("pending rollback after remove", func(t *testing.T) {
+		inst, mod, save, store := swappedPending(t)
+		clearJournalHooks(t)
+		var saved []byte
+		hookJournalRemove = func() error {
+			b, err := os.ReadFile(jpath(t, store.JournalDir, "default"))
+			if err != nil {
+				return err
+			}
+			saved = append([]byte(nil), b...)
+			return nil
+		}
+		hookAfterJournalRemove = func() error { return errors.New("crash before rotate") }
+		if err := store.Recover(inst, mod); err == nil {
+			t.Fatal("expected crash")
+		}
+		if got := readSave(t, save, "world.dat"); got != "old-save" {
+			t.Fatalf("world = %q", got)
+		}
+		if _, err := os.Stat(jpath(t, store.JournalDir, "default")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatal("journal was kept")
+		}
+		var planted journalFile
+		if err := json.Unmarshal(saved, &planted); err != nil {
+			t.Fatal(err)
+		}
+		got, err := store.expectedRestore("default")
+		if err != nil || got != planted.RestoreID {
+			t.Fatalf("rotated early: %q %q %v", planted.RestoreID, got, err)
+		}
+		if err := os.WriteFile(jpath(t, store.JournalDir, "default"), saved, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		hookJournalRemove = nil
+		hookAfterJournalRemove = nil
+		if err := store.Recover(inst, mod); !errors.Is(err, ErrMissingHold) {
+			t.Fatalf("replay = %v", err)
+		}
+		if err := store.DiscardJournal(inst); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Recover(inst, mod); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("committed rollback before remove", func(t *testing.T) {
+		inst, mod, save, store := committedHold(t)
+		clearJournalHooks(t)
+		hookJournalRemove = func() error { return errors.New("crash before remove") }
+		if err := store.Recover(inst, mod); err == nil {
+			t.Fatal("expected crash")
+		}
+		if got := readSave(t, save, "world.dat"); got != "live" {
+			t.Fatalf("world = %q", got)
+		}
+		if _, err := os.Stat(jpath(t, store.JournalDir, "default")); err != nil {
+			t.Fatal(err)
+		}
+		hookJournalRemove = nil
+		if err := store.Recover(inst, mod); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(jpath(t, store.JournalDir, "default")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatal("journal was kept")
+		}
+	})
+	t.Run("committed rollback after remove", func(t *testing.T) {
+		inst, mod, save, store := committedHold(t)
+		clearJournalHooks(t)
+		var saved []byte
+		hookJournalRemove = func() error {
+			b, err := os.ReadFile(jpath(t, store.JournalDir, "default"))
+			if err != nil {
+				return err
+			}
+			saved = append([]byte(nil), b...)
+			return nil
+		}
+		hookAfterJournalRemove = func() error { return errors.New("crash before rotate") }
+		if err := store.Recover(inst, mod); err == nil {
+			t.Fatal("expected crash")
+		}
+		if _, err := os.Stat(jpath(t, store.JournalDir, "default")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatal("journal was kept")
+		}
+		var planted journalFile
+		if err := json.Unmarshal(saved, &planted); err != nil {
+			t.Fatal(err)
+		}
+		got, err := store.expectedRestore("default")
+		if err != nil || got != planted.RestoreID {
+			t.Fatalf("rotated early: %q %q %v", planted.RestoreID, got, err)
+		}
+		if err := os.WriteFile(jpath(t, store.JournalDir, "default"), saved, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		hookJournalRemove = nil
+		hookAfterJournalRemove = nil
+		if err := store.Recover(inst, mod); err != nil {
+			t.Fatal(err)
+		}
+		after, err := store.expectedRestore("default")
+		if err != nil || after == got {
+			t.Fatalf("cleanup id = %q %q %v", got, after, err)
+		}
+		if got := readSave(t, save, "world.dat"); got != "live" {
+			t.Fatalf("world = %q", got)
+		}
+	})
+	t.Run("undo before remove", func(t *testing.T) {
+		inst, mod, save, store, entry := restorePair(t)
+		clearJournalHooks(t)
+		n := 0
+		store.swapFail = func() error {
+			n++
+			if n == 2 {
+				return errors.New("swap failed")
+			}
+			return nil
+		}
+		hookJournalRemove = func() error { return errors.New("crash before remove") }
+		err := store.Restore(context.Background(), entry.ID, inst, mod)
+		if err == nil || strings.Contains(err.Error(), "restored; cleanup failed") {
+			t.Fatalf("restore = %v", err)
+		}
+		if got := readSave(t, save, "world.dat"); got != "live" {
+			t.Fatalf("world = %q", got)
+		}
+		if _, err := os.Stat(jpath(t, store.JournalDir, "default")); err != nil {
+			t.Fatal(err)
+		}
+		store.swapFail = nil
+		hookJournalRemove = nil
+		if err := store.Recover(inst, mod); !errors.Is(err, ErrMissingHold) {
+			t.Fatalf("second = %v", err)
+		}
+		if err := store.DiscardJournal(inst); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Restore(context.Background(), entry.ID, inst, mod); err != nil {
+			t.Fatal(err)
+		}
+		if got := readSave(t, save, "world.dat"); got != "alpha" {
+			t.Fatalf("retried world = %q", got)
+		}
+	})
+	t.Run("undo after remove", func(t *testing.T) {
+		inst, mod, save, store, entry := restorePair(t)
+		clearJournalHooks(t)
+		n := 0
+		store.swapFail = func() error {
+			n++
+			if n == 2 {
+				return errors.New("swap failed")
+			}
+			return nil
+		}
+		hookAfterJournalRemove = func() error { return errors.New("crash before rotate") }
+		err := store.Restore(context.Background(), entry.ID, inst, mod)
+		if err == nil || strings.Contains(err.Error(), "restored; cleanup failed") {
+			t.Fatalf("restore = %v", err)
+		}
+		if got := readSave(t, save, "world.dat"); got != "live" {
+			t.Fatalf("world = %q", got)
+		}
+		if _, err := os.Stat(jpath(t, store.JournalDir, "default")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatal("journal was kept")
+		}
+		store.swapFail = nil
+		hookAfterJournalRemove = nil
+		if err := store.Recover(inst, mod); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Restore(context.Background(), entry.ID, inst, mod); err != nil {
+			t.Fatal(err)
+		}
+		if got := readSave(t, save, "world.dat"); got != "alpha" {
+			t.Fatalf("retried world = %q", got)
+		}
+	})
+}
+
+func clearJournalHooks(t *testing.T) {
+	t.Helper()
+	hookJournalRemove = nil
+	hookAfterJournalRemove = nil
+	hookMarkSwapped = nil
+	t.Cleanup(func() {
+		hookJournalRemove = nil
+		hookAfterJournalRemove = nil
+		hookMarkSwapped = nil
+	})
+}
+
+func restorePair(t *testing.T) (core.Instance, *plainsofpain.Module, string, *Store, Entry) {
+	t.Helper()
+	inst, mod, save := newWorld(t)
+	writeSave(t, save, "world.dat", "alpha")
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), JournalDir: t.TempDir(), Keep: 5, Key: testKey()}
+	entry, err := store.Create(context.Background(), Request{Instance: inst, Module: mod, Kind: KindManual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSave(t, save, "world.dat", "live")
+	return inst, mod, save, store, entry
+}
+
+func swappedPending(t *testing.T) (core.Instance, *plainsofpain.Module, string, *Store) {
+	t.Helper()
+	inst, mod, save := newWorld(t)
+	writeSave(t, save, "world.dat", "old-save")
+	hold := filepath.Join(filepath.Dir(save), ".gmanager-hold-"+filepath.Base(save))
+	if err := os.Rename(save, hold); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(save, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeSave(t, save, "world.dat", "new-save")
+	data := t.TempDir()
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), JournalDir: data, Keep: 5, Key: testKey()}
+	armTestRestore(t, store, "default")
+	pending := journalFile{
+		Version:   journalVersion,
+		State:     journalPending,
+		Instance:  "default",
+		RestoreID: "abc123abc123abc123abc123abc123ab",
+		Targets:   []journalTarget{{Dest: save, Hold: hold, Dir: true, Swapped: true}},
+	}
+	if err := writeJournal(data, "default", pending, testKey()); err != nil {
+		t.Fatal(err)
+	}
+	return inst, mod, save, store
+}
+
+func committedHold(t *testing.T) (core.Instance, *plainsofpain.Module, string, *Store) {
+	t.Helper()
+	inst, mod, save := newWorld(t)
+	writeSave(t, save, "world.dat", "live")
+	hold := filepath.Join(filepath.Dir(save), ".gmanager-hold-"+filepath.Base(save))
+	if err := os.MkdirAll(hold, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hold, "world.dat"), []byte("held"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	data := t.TempDir()
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), JournalDir: data, Keep: 5, Key: testKey()}
+	armTestRestore(t, store, "default")
+	committed := journalFile{
+		Version:   journalVersion,
+		State:     journalCommitted,
+		Instance:  "default",
+		RestoreID: "abc123abc123abc123abc123abc123ab",
+		Targets:   []journalTarget{{Dest: save, Hold: hold, Dir: true}},
+	}
+	if err := writeJournal(data, "default", committed, testKey()); err != nil {
+		t.Fatal(err)
+	}
+	return inst, mod, save, store
+}
+
 func TestStrayHoldBlocksRestoreAndDiscardHold(t *testing.T) {
 	inst, mod, save := newWorld(t)
 	writeSave(t, save, "world.dat", "alpha")

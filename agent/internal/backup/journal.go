@@ -50,6 +50,18 @@ var hookCommitCleanup func() error
 // and before it is read back. Tests use it to fail revalidation.
 var hookCommitReread func() error
 
+// hookJournalRemove, when set, runs immediately before the journal file is
+// removed. Tests use it to crash while the file is still on disk.
+var hookJournalRemove func() error
+
+// hookAfterJournalRemove, when set, runs after the journal file is removed
+// and before the restore id is rotated. Tests use it to crash in that window.
+var hookAfterJournalRemove func() error
+
+// hookMarkSwapped, when set, runs after a target has been swapped and before
+// the journal records that progress. Tests use it to fail that write.
+var hookMarkSwapped func() error
+
 type journalTarget struct {
 	Dest    string `json:"dest"`
 	Hold    string `json:"hold,omitempty"`
@@ -308,10 +320,14 @@ func acceptJournal(j journalFile, instance, expectedRestore string) error {
 	if j.Instance != instance {
 		return fmt.Errorf("%w: journal instance does not match", ErrJournal)
 	}
-	if j.RestoreID == "" || expectedRestore == "" || !hmac.Equal([]byte(j.RestoreID), []byte(expectedRestore)) {
+	if !journalIDMatches(j, expectedRestore) {
 		return fmt.Errorf("%w: restore id does not match", ErrJournal)
 	}
 	return nil
+}
+
+func journalIDMatches(j journalFile, expectedRestore string) bool {
+	return j.RestoreID != "" && expectedRestore != "" && hmac.Equal([]byte(j.RestoreID), []byte(expectedRestore))
 }
 
 func removeJournal(dir, instanceID string) error {
@@ -330,9 +346,10 @@ func removeJournal(dir, instanceID string) error {
 }
 
 // commitJournal fsyncs the committed record before any hold is deleted.
-// beforeRemove runs after the holds are gone and before the journal file is
-// removed, so a replay of this journal no longer matches.
-func commitJournal(dir, instanceID string, st *stagedSet, key []byte, allowed []string, restoreID string, beforeRemove func() error) error {
+// The journal file is removed before afterRemove runs. afterRemove rotates
+// the restore id, so a crash before the remove leaves an id that still
+// matches and a crash after it leaves no journal.
+func commitJournal(dir, instanceID string, st *stagedSet, key []byte, allowed []string, restoreID string, afterRemove func() error) error {
 	if err := writeJournal(dir, instanceID, journalFrom(st, journalCommitted, instanceID, restoreID), key); err != nil {
 		return err
 	}
@@ -359,31 +376,18 @@ func commitJournal(dir, instanceID string, st *stagedSet, key []byte, allowed []
 			return err
 		}
 	}
-	var errs error
-	for _, target := range j.Targets {
-		if target.Hold == "" {
-			continue
-		}
-		if err := refuseSpecial(target.Hold); err != nil {
-			errs = errors.Join(errs, err)
-			continue
-		}
-		if err := os.RemoveAll(target.Hold); err != nil && !errors.Is(err, os.ErrNotExist) {
-			errs = errors.Join(errs, err)
-		}
+	if err := deleteHolds(j); err != nil {
+		return err
 	}
-	if errs != nil {
-		return errs
-	}
-	if beforeRemove != nil {
-		if err := beforeRemove(); err != nil {
-			return err
-		}
-	}
-	return removeJournal(dir, instanceID)
+	return finishJournalFile(dir, instanceID, afterRemove)
 }
 
 func markSwapped(dir, instanceID string, key []byte, dest string) error {
+	if hookMarkSwapped != nil {
+		if err := hookMarkSwapped(); err != nil {
+			return err
+		}
+	}
 	j, err := readJournal(dir, instanceID, key)
 	if err != nil {
 		return err
@@ -426,7 +430,7 @@ func journalHoldsExist(dir, instanceID string, key []byte, allowed []string, exp
 	return false, nil
 }
 
-func rollbackJournal(dir, instanceID string, key []byte, allowed []string, expectedRestore string, beforeRemove func() error) error {
+func rollbackJournal(dir, instanceID string, key []byte, allowed []string, expectedRestore string, afterRemove func() error) error {
 	j, err := readJournal(dir, instanceID, key)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -441,28 +445,10 @@ func rollbackJournal(dir, instanceID string, key []byte, allowed []string, expec
 		return err
 	}
 	if j.State == journalCommitted {
-		var errs error
-		for _, target := range j.Targets {
-			if target.Hold == "" {
-				continue
-			}
-			if err := refuseSpecial(target.Hold); err != nil {
-				errs = errors.Join(errs, err)
-				continue
-			}
-			if err := os.RemoveAll(target.Hold); err != nil && !errors.Is(err, os.ErrNotExist) {
-				errs = errors.Join(errs, err)
-			}
+		if err := deleteHolds(j); err != nil {
+			return err
 		}
-		if errs != nil {
-			return errs
-		}
-		if beforeRemove != nil {
-			if err := beforeRemove(); err != nil {
-				return err
-			}
-		}
-		return removeJournal(dir, instanceID)
+		return finishJournalFile(dir, instanceID, afterRemove)
 	}
 	var errs error
 	for i := len(j.Targets) - 1; i >= 0; i-- {
@@ -482,12 +468,96 @@ func rollbackJournal(dir, instanceID string, key []byte, allowed []string, expec
 	if errs != nil {
 		return errs
 	}
-	if beforeRemove != nil {
-		if err := beforeRemove(); err != nil {
+	return finishJournalFile(dir, instanceID, afterRemove)
+}
+
+// finishJournalFile removes the journal and then runs afterRemove.
+// afterRemove rotates the restore id. Removing first means a crash in
+// between leaves no journal rather than a journal whose id can never match.
+func finishJournalFile(dir, instanceID string, afterRemove func() error) error {
+	if hookJournalRemove != nil {
+		if err := hookJournalRemove(); err != nil {
 			return err
 		}
 	}
-	return removeJournal(dir, instanceID)
+	if err := removeJournal(dir, instanceID); err != nil {
+		return err
+	}
+	if hookAfterJournalRemove != nil {
+		if err := hookAfterJournalRemove(); err != nil {
+			return err
+		}
+	}
+	if afterRemove != nil {
+		return afterRemove()
+	}
+	return nil
+}
+
+func deleteHolds(j journalFile) error {
+	var errs error
+	for _, target := range j.Targets {
+		if target.Hold == "" {
+			continue
+		}
+		if err := removeHold(target.Hold); err != nil {
+			errs = errors.Join(errs, err)
+		}
+	}
+	return errs
+}
+
+func removeHold(path string) error {
+	if err := refuseSpecial(path); err != nil {
+		return err
+	}
+	err := removeAllNoFollow(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+// journalFinished reports a committed journal whose holds are already gone.
+func journalFinished(j journalFile) bool {
+	if j.State != journalCommitted {
+		return false
+	}
+	for _, target := range j.Targets {
+		if target.Hold == "" {
+			continue
+		}
+		_, err := os.Lstat(target.Hold)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func childNameOK(name string) bool {
+	if name == "" || name == "." || name == ".." {
+		return false
+	}
+	return !strings.ContainsAny(name, `/\`)
+}
+
+func splitFinal(path string) (string, string, error) {
+	if path == "" {
+		return "", "", fmt.Errorf("%w: empty path", ErrJournal)
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", "", err
+	}
+	abs = filepath.Clean(abs)
+	name := filepath.Base(abs)
+	parent := filepath.Dir(abs)
+	if parent == abs || !childNameOK(name) {
+		return "", "", fmt.Errorf("%w: %s", ErrJournal, path)
+	}
+	return parent, name, nil
 }
 
 func journalIsCommitted(dir, instanceID string, key []byte, expectedRestore string) (bool, error) {

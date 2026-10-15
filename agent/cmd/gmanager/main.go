@@ -130,19 +130,12 @@ func main() {
 		JournalDir: dirData,
 	}
 	if err := archives.Recover(inst, mod); err != nil {
-		if backup.BlocksRestore(err) {
-			log.Printf("warning: restore journal: %v; restore is blocked until it is fixed", err)
-		} else {
-			stderr.Fatal(err)
-		}
+		log.Printf("warning: restore journal: %v; restore is blocked until it is fixed", err)
 	}
 	holds, err := archives.StrayHolds(inst, mod)
 	if err != nil {
-		if backup.BlocksRestore(err) {
-			log.Printf("warning: restore journal: %v; restore is blocked until it is fixed", err)
-		} else {
-			stderr.Fatal(err)
-		}
+		log.Printf("warning: restore journal: %v; restore is blocked until it is fixed", err)
+		holds = nil
 	}
 	for _, hold := range holds {
 		log.Printf("warning: unjournaled hold %s; restore is blocked until it is discarded", hold)
