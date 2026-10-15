@@ -1,11 +1,14 @@
 package backup
 
 import (
+	"crypto/hmac"
 	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/LeOtterTerry/GManager/agent/internal/core"
 )
@@ -157,9 +160,10 @@ func (s *Store) PreviewJournal(inst core.Instance, mod core.GameModule) (Journal
 }
 
 // RollbackJournal applies the instance journal when its HMAC and allowlist
-// pass, including when the restore id is stale. The journal file is removed
-// before the id is rotated.
-func (s *Store) RollbackJournal(inst core.Instance, mod core.GameModule) error {
+// pass, including when the restore id is stale. A stale id has to be the
+// restore id echoed from the preview. The journal file is removed before
+// the id is rotated.
+func (s *Store) RollbackJournal(inst core.Instance, mod core.GameModule, echoed string) error {
 	if s == nil {
 		return errors.New("backup directory is not configured")
 	}
@@ -184,6 +188,15 @@ func (s *Store) RollbackJournal(inst core.Instance, mod core.GameModule) error {
 	if err != nil {
 		return err
 	}
+	expected, expErr := s.expectedRestore(inst.ID)
+	matches := expErr == nil && journalIDMatches(j, expected)
+	if !matches {
+		if err := acknowledgeRestoreID(echoed, j.RestoreID); err != nil {
+			return err
+		}
+	} else if echoed != "" && !hmac.Equal([]byte(echoed), []byte(j.RestoreID)) {
+		return ErrRestoreIDAck
+	}
 	if err := validateJournal(j, allowed); err != nil {
 		return err
 	}
@@ -194,7 +207,12 @@ func (s *Store) RollbackJournal(inst core.Instance, mod core.GameModule) error {
 
 // DiscardJournal removes the instance journal file and then rotates that
 // instance's restore id. It does not rename saves, configs, or holds.
-func (s *Store) DiscardJournal(inst core.Instance) error {
+// A journal that still records a swapped target, or whose named hold is
+// gone, is left in place with ErrRollbackRequired unless force is set and
+// restoreID is the id from the preview. An unusable journal, a finished
+// journal, or a journal that has not swapped and whose holds are still on
+// disk may be removed without that override.
+func (s *Store) DiscardJournal(inst core.Instance, mod core.GameModule, force bool, restoreID string) error {
 	if s == nil {
 		return errors.New("backup directory is not configured")
 	}
@@ -210,9 +228,76 @@ func (s *Store) DiscardJournal(inst core.Instance) error {
 	if s.journalMissing(inst.ID) {
 		return ErrNotFound
 	}
-	return finishJournalFile(dir, inst.ID, func() error {
-		return s.rotateRestoreID(inst.ID)
+	key, err := s.readIntegrityKey()
+	if err != nil {
+		return err
+	}
+	j, err := readJournal(dir, inst.ID, key)
+	if errors.Is(err, os.ErrNotExist) {
+		return ErrNotFound
+	}
+	if err != nil {
+		if !journalUnusable(err) {
+			return err
+		}
+		return s.discardUnverified(dir, inst.ID, err)
+	}
+	allowed, aerr := allowedDests(inst, mod)
+	if aerr != nil {
+		return aerr
+	}
+	if verr := validateJournal(j, allowed); verr != nil {
+		return s.discardAllowlist(dir, inst.ID, verr)
+	}
+	if journalFinished(j) || journalIdle(j) {
+		return s.dropJournal(dir, inst.ID)
+	}
+	if force && restoreID != "" && hmac.Equal([]byte(restoreID), []byte(j.RestoreID)) {
+		path, perr := journalPath(dir, inst.ID)
+		if perr != nil {
+			return perr
+		}
+		log.Printf("WARNING: force-discarding restore journal %s restore id %s state %s", path, j.RestoreID, j.State)
+		return s.dropJournal(dir, inst.ID)
+	}
+	if force && restoreID != "" {
+		return ErrRestoreIDAck
+	}
+	return ErrRollbackRequired
+}
+
+func (s *Store) discardUnverified(dir, instanceID string, reason error) error {
+	path, err := journalPath(dir, instanceID)
+	if err != nil {
+		return err
+	}
+	log.Printf("WARNING: discarding unverified restore journal %s: %v", path, reason)
+	return s.dropJournal(dir, instanceID)
+}
+
+func (s *Store) discardAllowlist(dir, instanceID string, reason error) error {
+	path, err := journalPath(dir, instanceID)
+	if err != nil {
+		return err
+	}
+	log.Printf("WARNING: discarding restore journal %s that failed the allowlist: %v", path, reason)
+	return s.dropJournal(dir, instanceID)
+}
+
+func (s *Store) dropJournal(dir, instanceID string) error {
+	return finishJournalFile(dir, instanceID, func() error {
+		return s.rotateRestoreID(instanceID)
 	})
+}
+
+func acknowledgeRestoreID(echoed, actual string) error {
+	if echoed == "" {
+		return ErrRestoreIDRequired
+	}
+	if !hmac.Equal([]byte(echoed), []byte(actual)) {
+		return ErrRestoreIDAck
+	}
+	return nil
 }
 
 // StrayHolds lists hold copies beside a save or config path that the
@@ -274,66 +359,150 @@ func (s *Store) StrayHolds(inst core.Instance, mod core.GameModule) ([]string, e
 	return out, nil
 }
 
+// HoldView is the size and modification time an operator must send back
+// before a hold can be deleted.
+type HoldView struct {
+	Path    string `json:"path"`
+	Size    int64  `json:"size"`
+	ModTime string `json:"modTime"`
+}
+
+// PreviewHold reads one hold beside a save or config path and does not
+// delete it. ModTime is UTC RFC3339Nano.
+func (s *Store) PreviewHold(inst core.Instance, mod core.GameModule, hold string) (HoldView, error) {
+	if s == nil {
+		return HoldView{}, errors.New("backup directory is not configured")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	info, _, err := s.inspectHold(inst, mod, hold)
+	if err != nil {
+		return HoldView{}, err
+	}
+	return HoldView{
+		Path:    hold,
+		Size:    info.Size(),
+		ModTime: info.ModTime().UTC().Format(time.RFC3339Nano),
+	}, nil
+}
+
 // DiscardHold removes one unjournaled hold beside a save or config path.
-func (s *Store) DiscardHold(inst core.Instance, mod core.GameModule, hold string) error {
+// size and modTime must match a fresh stat of that hold. A destination that
+// is missing, parked under the undo suffix, or sitting next to a staging
+// directory is refused.
+func (s *Store) DiscardHold(inst core.Instance, mod core.GameModule, hold string, size int64, modTime time.Time) error {
 	if s == nil {
 		return errors.New("backup directory is not configured")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	allowed, err := allowedDests(inst, mod)
+	info, allowed, err := s.inspectHold(inst, mod, hold)
 	if err != nil {
 		return err
 	}
-	if !holdMatches(hold, allowed) {
-		return ErrInvalidHold
-	}
-	if err := refuseSpecial(hold); err != nil {
+	if err := s.holdNamedByJournal(inst, allowed, hold); err != nil {
 		return err
 	}
-	info, err := os.Lstat(hold)
-	if errors.Is(err, os.ErrNotExist) {
-		return ErrNotFound
+	if destMidRestore(hold, allowed) {
+		return ErrMidRestore
 	}
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("%w: %s is a symlink", ErrJournal, hold)
-	}
-	if !s.journalMissing(inst.ID) {
-		dir, err := s.journalDirectory()
-		if err != nil {
-			return err
-		}
-		key, err := s.readIntegrityKey()
-		if err != nil {
-			return err
-		}
-		j, err := readJournal(dir, inst.ID, key)
-		if err != nil {
-			return err
-		}
-		expected, err := s.expectedRestore(inst.ID)
-		if err != nil {
-			return err
-		}
-		if err := acceptJournal(j, inst.ID, expected); err != nil {
-			return err
-		}
-		if err := validateJournal(j, allowed); err != nil {
-			return err
-		}
-		for _, target := range j.Targets {
-			if target.Hold != "" && SamePath(target.Hold, hold) {
-				return ErrHoldInUse
-			}
-		}
+	if info.Size() != size || info.ModTime().UnixNano() != modTime.UnixNano() {
+		return ErrHoldChanged
 	}
 	if err := removeAllNoFollow(hold); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil
+}
+
+func (s *Store) inspectHold(inst core.Instance, mod core.GameModule, hold string) (os.FileInfo, []string, error) {
+	allowed, err := allowedDests(inst, mod)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !holdMatches(hold, allowed) {
+		return nil, nil, ErrInvalidHold
+	}
+	if err := refuseSpecial(hold); err != nil {
+		return nil, nil, err
+	}
+	info, err := os.Lstat(hold)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, nil, fmt.Errorf("%w: %s is a symlink", ErrJournal, hold)
+	}
+	return info, allowed, nil
+}
+
+func (s *Store) holdNamedByJournal(inst core.Instance, allowed []string, hold string) error {
+	if s.journalMissing(inst.ID) {
+		return nil
+	}
+	dir, err := s.journalDirectory()
+	if err != nil {
+		return err
+	}
+	key, err := s.readIntegrityKey()
+	if err != nil {
+		return err
+	}
+	j, err := readJournal(dir, inst.ID, key)
+	if err != nil {
+		return err
+	}
+	expected, err := s.expectedRestore(inst.ID)
+	if err != nil {
+		return err
+	}
+	if err := acceptJournal(j, inst.ID, expected); err != nil {
+		return err
+	}
+	if err := validateJournal(j, allowed); err != nil {
+		return err
+	}
+	for _, target := range j.Targets {
+		if target.Hold != "" && SamePath(target.Hold, hold) {
+			return ErrHoldInUse
+		}
+	}
+	return nil
+}
+
+// destMidRestore reports a hold whose destination is not a settled save or
+// config path. A missing destination means this hold may be the only copy.
+func destMidRestore(hold string, allowed []string) bool {
+	dest := ""
+	for _, candidate := range allowed {
+		if holdNameOK(candidate, hold) {
+			dest = candidate
+			break
+		}
+	}
+	if dest == "" {
+		return true
+	}
+	if _, err := os.Lstat(dest); err != nil {
+		return true
+	}
+	if _, err := os.Lstat(dest + undoSuffix); err == nil {
+		return true
+	}
+	entries, err := os.ReadDir(filepath.Dir(dest))
+	if err != nil {
+		return true
+	}
+	for _, ent := range entries {
+		name := ent.Name()
+		if strings.HasPrefix(name, restorePrefix) && len(name) > len(restorePrefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) journalDirectory() (string, error) {

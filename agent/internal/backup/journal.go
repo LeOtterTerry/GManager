@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,6 +42,24 @@ var ErrInvalidHold = errors.New("not a restore hold")
 
 // ErrHoldInUse means a verified journal still names the hold.
 var ErrHoldInUse = errors.New("hold is named by the restore journal")
+
+// ErrRollbackRequired means the journal still describes a restore that has
+// to be rolled back. Discarding it would drop the only record of that work.
+var ErrRollbackRequired = errors.New("rollback required")
+
+// ErrRestoreIDRequired means a journal whose id does not match was not
+// acknowledged with the restore id from the preview.
+var ErrRestoreIDRequired = errors.New("restore id acknowledgement is required")
+
+// ErrRestoreIDAck means the restore id sent back does not match the journal.
+var ErrRestoreIDAck = errors.New("restore id acknowledgement does not match")
+
+// ErrHoldChanged means the hold's size or modification time does not match
+// the preview the operator confirmed.
+var ErrHoldChanged = errors.New("hold changed")
+
+// ErrMidRestore means the destination still looks like a restore in progress.
+var ErrMidRestore = errors.New("destination looks mid-restore")
 
 // hookCommitCleanup, when set, runs after the committed journal is fsynced
 // and before its holds are deleted. Tests use it to fail cleanup.
@@ -461,7 +480,7 @@ func rollbackJournal(dir, instanceID string, key []byte, allowed []string, expec
 			errs = errors.Join(errs, err)
 			continue
 		}
-		if err := os.RemoveAll(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := removeAllNoFollow(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = errors.Join(errs, err)
 		}
 	}
@@ -519,6 +538,46 @@ func removeHold(path string) error {
 }
 
 // journalFinished reports a committed journal whose holds are already gone.
+// journalIdle is a journal that has not swapped any target and whose named
+// holds are all still on disk. An empty hold means that destination did not
+// exist when the journal was written.
+func journalIdle(j journalFile) bool {
+	for _, target := range j.Targets {
+		if target.Swapped {
+			return false
+		}
+		if target.Hold == "" {
+			continue
+		}
+		if _, err := os.Lstat(target.Hold); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// journalUnusable reports a journal file that cannot be trusted: bad HMAC,
+// wrong instance, bad JSON, or a path check that failed before the body
+// was accepted. Callers may delete that file and must not follow paths
+// inside it.
+func journalUnusable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrJournalAuth) || errors.Is(err, ErrJournal) {
+		return true
+	}
+	var syn *json.SyntaxError
+	var typ *json.UnmarshalTypeError
+	if errors.As(err, &syn) || errors.As(err, &typ) {
+		return true
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	return strings.HasPrefix(err.Error(), "json:")
+}
+
 func journalFinished(j journalFile) bool {
 	if j.State != journalCommitted {
 		return false
@@ -589,7 +648,7 @@ func restoreHold(target journalTarget) error {
 		if err != nil {
 			return err
 		}
-		return os.RemoveAll(target.Dest)
+		return removeAllNoFollow(target.Dest)
 	}
 	if err := refuseSpecial(target.Hold); err != nil {
 		return err

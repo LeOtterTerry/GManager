@@ -4,6 +4,9 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -547,14 +550,36 @@ func TestDiscardHoldAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	status, body, _ := do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/discard-hold", "test-token", string(noConfirm), nil)
-	if status != http.StatusBadRequest || !bytes.Contains(body, []byte("confirm_required")) {
-		t.Fatalf("confirm = %d %s", status, body)
+	if status != http.StatusOK || !bytes.Contains(body, []byte(`"action":"discard-hold-preview"`)) {
+		t.Fatalf("preview = %d %s", status, body)
+	}
+	var preview struct {
+		Path    string `json:"path"`
+		Size    int64  `json:"size"`
+		ModTime string `json:"modTime"`
+	}
+	if err := json.Unmarshal(body, &preview); err != nil {
+		t.Fatal(err)
+	}
+	if preview.Path != hold || preview.ModTime == "" {
+		t.Fatalf("preview body = %s", body)
+	}
+	if _, err := os.Stat(hold); err != nil {
+		t.Fatal("preview removed the hold")
 	}
 	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/discard-hold", "test-token", `{"confirm":true}`, nil)
 	if status != http.StatusBadRequest || !bytes.Contains(body, []byte("hold_required")) {
 		t.Fatalf("path = %d %s", status, body)
 	}
-	badPath, err := json.Marshal(map[string]any{"confirm": true, "path": save})
+	confirmOnly, err := json.Marshal(map[string]any{"confirm": true, "path": hold})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/discard-hold", "test-token", string(confirmOnly), nil)
+	if status != http.StatusBadRequest || !bytes.Contains(body, []byte("hold_stat_required")) {
+		t.Fatalf("stat = %d %s", status, body)
+	}
+	badPath, err := json.Marshal(map[string]any{"confirm": true, "path": save, "size": preview.Size, "modTime": preview.ModTime})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -562,7 +587,18 @@ func TestDiscardHoldAPI(t *testing.T) {
 	if status != http.StatusBadRequest || !bytes.Contains(body, []byte("invalid_hold")) {
 		t.Fatalf("invalid = %d %s", status, body)
 	}
-	raw, err := json.Marshal(map[string]any{"confirm": true, "path": hold})
+	changed, err := json.Marshal(map[string]any{"confirm": true, "path": hold, "size": preview.Size + 1, "modTime": preview.ModTime})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/discard-hold", "test-token", string(changed), nil)
+	if status != http.StatusConflict || !bytes.Contains(body, []byte("hold_changed")) {
+		t.Fatalf("changed = %d %s", status, body)
+	}
+	if _, err := os.Stat(hold); err != nil {
+		t.Fatal("changed stat removed the hold")
+	}
+	raw, err := json.Marshal(map[string]any{"confirm": true, "path": hold, "size": preview.Size, "modTime": preview.ModTime})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -625,6 +661,85 @@ func TestJournalAPI(t *testing.T) {
 	if status != http.StatusNotFound {
 		t.Fatalf("second discard = %d %s", status, body)
 	}
+}
+
+func TestDiscardSwappedJournalAPI(t *testing.T) {
+	save := t.TempDir()
+	archives := testArchives(t, 5)
+	_, httpSrv, cfgPath := newAPIOpt(t, 50, Options{Archives: archives})
+	writeCfg(t, cfgPath, configJSON(t, save, "kept"))
+	hold := filepath.Join(filepath.Dir(save), ".gmanager-hold-"+filepath.Base(save))
+	if err := os.MkdirAll(hold, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hold, "world.dat"), []byte("old-save"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(save, "world.dat"), []byte("new-save"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const restoreID = "abc123abc123abc123abc123abc123ab"
+	path := filepath.Join(archives.JournalDir, ".gmanager-restore-journal-default")
+	if err := os.WriteFile(path, sealedPendingJournal(t, archives.Key, save, hold, restoreID), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	status, body, _ := do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/journal", "test-token", `{"confirm":true,"op":"discard"}`, nil)
+	if status != http.StatusConflict || !bytes.Contains(body, []byte("rollback_required")) {
+		t.Fatalf("discard = %d %s", status, body)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal("journal was removed")
+	}
+	if _, err := os.Stat(hold); err != nil {
+		t.Fatal("hold was removed")
+	}
+	if got, err := os.ReadFile(filepath.Join(save, "world.dat")); err != nil || string(got) != "new-save" {
+		t.Fatalf("world = %q %v", got, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(hold, "world.dat")); err != nil || string(got) != "old-save" {
+		t.Fatalf("hold world = %q %v", got, err)
+	}
+}
+
+type apiJournalTarget struct {
+	Dest    string `json:"dest"`
+	Hold    string `json:"hold,omitempty"`
+	Dir     bool   `json:"dir"`
+	Swapped bool   `json:"swapped,omitempty"`
+}
+
+type apiJournalFile struct {
+	Version   int                `json:"version"`
+	State     string             `json:"state"`
+	Instance  string             `json:"instance"`
+	RestoreID string             `json:"restoreID"`
+	Targets   []apiJournalTarget `json:"targets"`
+	HMAC      string             `json:"hmac,omitempty"`
+}
+
+func sealedPendingJournal(t *testing.T, key []byte, save, hold, restoreID string) []byte {
+	t.Helper()
+	j := apiJournalFile{
+		Version:   1,
+		State:     "pending",
+		Instance:  "default",
+		RestoreID: restoreID,
+		Targets:   []apiJournalTarget{{Dest: save, Hold: hold, Dir: true, Swapped: true}},
+	}
+	mac, err := json.Marshal(j)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := hmac.New(sha256.New, key)
+	if _, err := sum.Write(mac); err != nil {
+		t.Fatal(err)
+	}
+	j.HMAC = hex.EncodeToString(sum.Sum(nil))
+	raw, err := json.MarshalIndent(j, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append(raw, '\n')
 }
 
 func TestUserDirOverrideWinsOverConfig(t *testing.T) {

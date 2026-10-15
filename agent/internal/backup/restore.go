@@ -55,6 +55,11 @@ func (s *Store) Restore(ctx context.Context, id string, inst core.Instance, mod 
 // back from their holds. safetyID is written back only when that rename fails
 // and those holds are already gone.
 func (s *Store) RestoreInto(ctx context.Context, id string, inst core.Instance, mod core.GameModule, safetyID string, adapt func(string, []byte) ([]byte, error)) error {
+	if s == nil {
+		return errors.New("backup directory is not configured")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -303,13 +308,13 @@ func stageSave(a *archive, index int, dest string) (stagedDir, error) {
 		}
 		target := filepath.Join(tmp, filepath.FromSlash(f.Rel))
 		if err := within(tmp, target); err != nil {
-			if rmErr := os.RemoveAll(tmp); rmErr != nil {
+			if rmErr := removeAllNoFollow(tmp); rmErr != nil {
 				return stagedDir{}, errors.Join(err, rmErr)
 			}
 			return stagedDir{}, err
 		}
 		if err := extractChecked(a, f, target); err != nil {
-			if rmErr := os.RemoveAll(tmp); rmErr != nil {
+			if rmErr := removeAllNoFollow(tmp); rmErr != nil {
 				return stagedDir{}, errors.Join(err, rmErr)
 			}
 			return stagedDir{}, err
@@ -507,7 +512,7 @@ func (st *stagedSet) discard() error {
 		if st.dirs[i].swapped || st.dirs[i].tmp == "" {
 			continue
 		}
-		if rmErr := os.RemoveAll(st.dirs[i].tmp); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+		if rmErr := removeAllNoFollow(st.dirs[i].tmp); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
 			err = errors.Join(err, rmErr)
 		}
 	}
@@ -557,7 +562,7 @@ func undoSwapped(dest, hold string, swapped bool) error {
 	if !swapped {
 		return nil
 	}
-	if err := os.RemoveAll(dest); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := removeAllNoFollow(dest); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil
@@ -565,7 +570,7 @@ func undoSwapped(dest, hold string, swapped bool) error {
 
 func putBack(dest, hold string) error {
 	junk := dest + undoSuffix
-	if err := os.RemoveAll(junk); err != nil {
+	if err := removeAllNoFollow(junk); err != nil {
 		return err
 	}
 	if _, err := os.Lstat(dest); err == nil {
@@ -578,7 +583,7 @@ func putBack(dest, hold string) error {
 	if err := renameRetry(hold, dest); err != nil {
 		return err
 	}
-	if err := os.RemoveAll(junk); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := removeAllNoFollow(junk); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return syncDir(filepath.Dir(dest))

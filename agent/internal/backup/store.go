@@ -1704,7 +1704,7 @@ func (s *Store) signLocked(id string) error {
 		return err
 	}
 	defer func() {
-		if rmErr := os.RemoveAll(tmp); rmErr != nil {
+		if rmErr := removeAllNoFollow(tmp); rmErr != nil {
 			return
 		}
 	}()

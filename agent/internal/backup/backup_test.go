@@ -1483,7 +1483,22 @@ func TestJournalOperatorRollbackAndDiscard(t *testing.T) {
 	if len(view.Targets) != 1 || !view.Targets[0].HoldPresent || !view.Targets[0].Swapped {
 		t.Fatalf("targets = %+v", view.Targets)
 	}
-	if err := store.RollbackJournal(inst, mod); err != nil {
+	if err := store.RollbackJournal(inst, mod, ""); !errors.Is(err, ErrRestoreIDRequired) {
+		t.Fatalf("rollback without id = %v", err)
+	}
+	if got := readSave(t, save, "world.dat"); got != "new" {
+		t.Fatalf("unacked world = %q", got)
+	}
+	if _, err := os.Stat(hold); err != nil {
+		t.Fatal("unacked hold was removed")
+	}
+	if _, err := os.Stat(jpath(t, data, "default")); err != nil {
+		t.Fatal("unacked journal was removed")
+	}
+	if err := store.RollbackJournal(inst, mod, "not-the-journal-id"); !errors.Is(err, ErrRestoreIDAck) {
+		t.Fatalf("rollback bad id = %v", err)
+	}
+	if err := store.RollbackJournal(inst, mod, view.RestoreID); err != nil {
 		t.Fatal(err)
 	}
 	if got := readSave(t, save, "world.dat"); got != "old" {
@@ -1503,7 +1518,7 @@ func TestJournalOperatorRollbackAndDiscard(t *testing.T) {
 	if err := writeJournal(data, "default", pending, testKey()); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.RollbackJournal(inst, mod); !errors.Is(err, ErrMissingHold) {
+	if err := store.RollbackJournal(inst, mod, ""); !errors.Is(err, ErrMissingHold) {
 		t.Fatalf("anomaly rollback = %v", err)
 	}
 	if _, err := os.Stat(jpath(t, data, "default")); err != nil {
@@ -1512,7 +1527,10 @@ func TestJournalOperatorRollbackAndDiscard(t *testing.T) {
 	if got := readSave(t, save, "world.dat"); got != "half" {
 		t.Fatalf("discard-not-yet world = %q", got)
 	}
-	if err := store.DiscardJournal(inst); err != nil {
+	if err := store.DiscardJournal(inst, mod, false, ""); !errors.Is(err, ErrRollbackRequired) {
+		t.Fatalf("anomaly discard = %v", err)
+	}
+	if err := store.DiscardJournal(inst, mod, true, pending.RestoreID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(jpath(t, data, "default")); !errors.Is(err, os.ErrNotExist) {
@@ -1524,8 +1542,163 @@ func TestJournalOperatorRollbackAndDiscard(t *testing.T) {
 	if err := store.Recover(inst, mod); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DiscardJournal(inst); !errors.Is(err, ErrNotFound) {
+	if err := store.DiscardJournal(inst, mod, false, ""); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("second discard = %v", err)
+	}
+}
+
+func TestDiscardPendingSwappedJournalRequiresRollback(t *testing.T) {
+	inst, mod, save, store := swappedPending(t)
+	hold := filepath.Join(filepath.Dir(save), ".gmanager-hold-"+filepath.Base(save))
+	if err := store.DiscardJournal(inst, mod, false, ""); !errors.Is(err, ErrRollbackRequired) {
+		t.Fatalf("discard = %v", err)
+	}
+	if _, err := os.Stat(jpath(t, store.JournalDir, "default")); err != nil {
+		t.Fatal("journal was removed")
+	}
+	if _, err := os.Stat(hold); err != nil {
+		t.Fatal("hold was removed")
+	}
+	if got := readSave(t, save, "world.dat"); got != "new-save" {
+		t.Fatalf("world = %q", got)
+	}
+	if got := readSave(t, hold, "world.dat"); got != "old-save" {
+		t.Fatalf("hold world = %q", got)
+	}
+	if err := store.DiscardJournal(inst, mod, true, "not-the-journal-id"); !errors.Is(err, ErrRestoreIDAck) {
+		t.Fatalf("force mismatch = %v", err)
+	}
+	if _, err := os.Stat(jpath(t, store.JournalDir, "default")); err != nil {
+		t.Fatal("mismatched force removed the journal")
+	}
+	size, modTime := holdStat(t, hold)
+	if err := store.DiscardHold(inst, mod, hold, size, modTime); !errors.Is(err, ErrHoldInUse) {
+		t.Fatalf("hold discard = %v", err)
+	}
+	if _, err := os.Stat(hold); err != nil {
+		t.Fatal("in-use hold was removed")
+	}
+	if got := readSave(t, save, "world.dat"); got != "new-save" {
+		t.Fatalf("world after hold discard = %q", got)
+	}
+}
+
+func TestDiscardUnverifiedJournalLeavesHold(t *testing.T) {
+	inst, mod, save, store := swappedPending(t)
+	hold := filepath.Join(filepath.Dir(save), ".gmanager-hold-"+filepath.Base(save))
+	if err := os.WriteFile(jpath(t, store.JournalDir, "default"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DiscardJournal(inst, mod, false, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(jpath(t, store.JournalDir, "default")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("unverified journal was kept")
+	}
+	if _, err := os.Stat(hold); err != nil {
+		t.Fatal("unverified discard removed the hold")
+	}
+	if got := readSave(t, hold, "world.dat"); got != "old-save" {
+		t.Fatalf("hold world = %q", got)
+	}
+	if got := readSave(t, save, "world.dat"); got != "new-save" {
+		t.Fatalf("world = %q", got)
+	}
+}
+
+func TestDiscardIdleJournalKeepsHold(t *testing.T) {
+	inst, mod, save, store := swappedPending(t)
+	j, err := readJournal(store.JournalDir, "default", testKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	j.Targets[0].Swapped = false
+	if err := writeJournal(store.JournalDir, "default", j, testKey()); err != nil {
+		t.Fatal(err)
+	}
+	hold := filepath.Join(filepath.Dir(save), ".gmanager-hold-"+filepath.Base(save))
+	if err := store.DiscardJournal(inst, mod, false, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(jpath(t, store.JournalDir, "default")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("idle journal was kept")
+	}
+	if got := readSave(t, hold, "world.dat"); got != "old-save" {
+		t.Fatalf("hold world = %q", got)
+	}
+	if got := readSave(t, save, "world.dat"); got != "new-save" {
+		t.Fatalf("world = %q", got)
+	}
+}
+
+func TestDiscardHoldRefusesMidRestore(t *testing.T) {
+	inst, mod, save := newWorld(t)
+	writeSave(t, save, "world.dat", "live")
+	hold := filepath.Join(filepath.Dir(save), ".gmanager-hold-"+filepath.Base(save))
+	if err := os.MkdirAll(hold, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hold, "world.dat"), []byte("only-copy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), JournalDir: t.TempDir(), Keep: 5, Key: testKey()}
+	if err := os.RemoveAll(save); err != nil {
+		t.Fatal(err)
+	}
+	size, modTime := holdStat(t, hold)
+	if err := store.DiscardHold(inst, mod, hold, size, modTime); !errors.Is(err, ErrMidRestore) {
+		t.Fatalf("mid-restore = %v", err)
+	}
+	if _, err := os.Stat(hold); err != nil {
+		t.Fatal("mid-restore hold was removed")
+	}
+	if err := store.DiscardHold(inst, mod, hold, size+1, modTime); !errors.Is(err, ErrMidRestore) {
+		t.Fatalf("mid-restore before stat = %v", err)
+	}
+}
+
+func TestRestoreIntoSerializesWithJournal(t *testing.T) {
+	inst, mod, save, store, entry := restorePair(t)
+	writeSave(t, save, "world.dat", "live")
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	store.swapFail = func() error {
+		close(entered)
+		<-release
+		return errors.New("swap failed")
+	}
+	restoreErr := make(chan error, 1)
+	go func() {
+		restoreErr <- store.Restore(context.Background(), entry.ID, inst, mod)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("restore did not reach the swap")
+	}
+	discardErr := make(chan error, 1)
+	go func() {
+		discardErr <- store.DiscardJournal(inst, mod, false, "")
+	}()
+	select {
+	case err := <-discardErr:
+		t.Fatalf("discard ran during restore: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if err := <-restoreErr; err == nil || !strings.Contains(err.Error(), "swap failed") {
+		t.Fatalf("restore = %v", err)
+	}
+	select {
+	case err := <-discardErr:
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("discard after restore = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("discard did not finish")
+	}
+	if got := readSave(t, save, "world.dat"); got != "live" {
+		t.Fatalf("world = %q", got)
 	}
 }
 
@@ -1789,9 +1962,7 @@ func TestJournalRemoveAndRotateBoundaries(t *testing.T) {
 		if err := store.Recover(inst, mod); !errors.Is(err, ErrMissingHold) {
 			t.Fatalf("second = %v", err)
 		}
-		if err := store.DiscardJournal(inst); err != nil {
-			t.Fatal(err)
-		}
+		forceDiscardJournal(t, store, inst, mod)
 		if err := store.Recover(inst, mod); err != nil {
 			t.Fatal(err)
 		}
@@ -1834,9 +2005,7 @@ func TestJournalRemoveAndRotateBoundaries(t *testing.T) {
 		if err := store.Recover(inst, mod); !errors.Is(err, ErrMissingHold) {
 			t.Fatalf("replay = %v", err)
 		}
-		if err := store.DiscardJournal(inst); err != nil {
-			t.Fatal(err)
-		}
+		forceDiscardJournal(t, store, inst, mod)
 		if err := store.Recover(inst, mod); err != nil {
 			t.Fatal(err)
 		}
@@ -1932,9 +2101,7 @@ func TestJournalRemoveAndRotateBoundaries(t *testing.T) {
 		if err := store.Recover(inst, mod); !errors.Is(err, ErrMissingHold) {
 			t.Fatalf("second = %v", err)
 		}
-		if err := store.DiscardJournal(inst); err != nil {
-			t.Fatal(err)
-		}
+		forceDiscardJournal(t, store, inst, mod)
 		if err := store.Restore(context.Background(), entry.ID, inst, mod); err != nil {
 			t.Fatal(err)
 		}
@@ -2100,7 +2267,7 @@ func TestStrayHoldBlocksRestoreAndDiscardHold(t *testing.T) {
 	if err := os.WriteFile(victim, []byte("keep"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DiscardHold(inst, mod, victim); !errors.Is(err, ErrInvalidHold) {
+	if err := store.DiscardHold(inst, mod, victim, 0, time.Time{}); !errors.Is(err, ErrInvalidHold) {
 		t.Fatalf("victim discard = %v", err)
 	}
 	if got, err := os.ReadFile(victim); err != nil || string(got) != "keep" {
@@ -2110,7 +2277,7 @@ func TestStrayHoldBlocksRestoreAndDiscardHold(t *testing.T) {
 	if err := os.Symlink(victim, linkHold); err != nil {
 		t.Logf("symlink hold not tested: %v", err)
 	} else {
-		if err := store.DiscardHold(inst, mod, linkHold); !errors.Is(err, ErrJournal) {
+		if err := store.DiscardHold(inst, mod, linkHold, 0, time.Time{}); !errors.Is(err, ErrJournal) {
 			t.Fatalf("symlink discard = %v", err)
 		}
 		if got, err := os.ReadFile(victim); err != nil || string(got) != "keep" {
@@ -2123,7 +2290,8 @@ func TestStrayHoldBlocksRestoreAndDiscardHold(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := store.DiscardHold(inst, mod, hold); err != nil {
+	size, modTime := holdStat(t, hold)
+	if err := store.DiscardHold(inst, mod, hold, size, modTime); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(hold); !errors.Is(err, os.ErrNotExist) {
@@ -2151,7 +2319,7 @@ func TestStrayHoldBlocksRestoreAndDiscardHold(t *testing.T) {
 	if err := writeJournal(store.JournalDir, "default", bindJournal(named), testKey()); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DiscardHold(inst, mod, hold); !errors.Is(err, ErrHoldInUse) {
+	if err := store.DiscardHold(inst, mod, hold, 0, time.Time{}); !errors.Is(err, ErrHoldInUse) {
 		t.Fatalf("in use = %v", err)
 	}
 	if _, err := os.Stat(hold); err != nil {
@@ -2198,6 +2366,26 @@ func jpath(t *testing.T, dir, instance string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func holdStat(t *testing.T, hold string) (int64, time.Time) {
+	t.Helper()
+	info, err := os.Lstat(hold)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.Size(), info.ModTime()
+}
+
+func forceDiscardJournal(t *testing.T, store *Store, inst core.Instance, mod *plainsofpain.Module) {
+	t.Helper()
+	j, err := readJournal(store.JournalDir, inst.ID, testKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DiscardJournal(inst, mod, true, j.RestoreID); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func armTestRestore(t *testing.T, store *Store, instance string) string {

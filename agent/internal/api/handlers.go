@@ -331,12 +331,6 @@ func (s *Server) postDiscardHold(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "invalid_body", Message: "body must be JSON"}}
 		}
-		if !ok {
-			return decision{Status: http.StatusBadRequest, Body: errorBody{
-				Error:   "confirm_required",
-				Message: "discard-hold requires confirm=true",
-			}}
-		}
 		hold, err := holdPathBody(body)
 		if err != nil {
 			return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "hold_required", Message: "discard-hold requires a hold path"}}
@@ -347,20 +341,29 @@ func (s *Server) postDiscardHold(w http.ResponseWriter, r *http.Request) {
 				Message: "backup directory is not configured",
 			}}
 		}
-		if err := s.archives.DiscardHold(s.withSaveDir(s.inst), s.mod, hold); err != nil {
-			if errors.Is(err, backup.ErrInvalidHold) {
-				return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "invalid_hold", Message: "not a restore hold"}}
+		inst := s.withSaveDir(s.inst)
+		if !ok {
+			view, err := s.archives.PreviewHold(inst, s.mod, hold)
+			if err != nil {
+				return holdDecision(err)
 			}
-			if errors.Is(err, backup.ErrNotFound) {
-				return decision{Status: http.StatusNotFound, Body: errorBody{Error: "not_found", Message: "unknown hold"}}
+			return decision{Status: http.StatusOK, Body: struct {
+				Action string `json:"action"`
+				backup.HoldView
+			}{Action: "discard-hold-preview", HoldView: view}}
+		}
+		size, modTime, statErr := holdStatAck(body)
+		if statErr != nil {
+			code := "hold_stat_required"
+			message := "discard-hold requires the size and modTime from the preview"
+			if errors.Is(statErr, errInvalidModTime) {
+				code = "invalid_mod_time"
+				message = "modTime must be RFC3339Nano from the preview"
 			}
-			if errors.Is(err, backup.ErrHoldInUse) {
-				return decision{Status: http.StatusConflict, Body: errorBody{Error: "hold_in_use", Message: "hold is named by the restore journal"}}
-			}
-			if errors.Is(err, backup.ErrJournal) || errors.Is(err, backup.ErrJournalAuth) {
-				return decision{Status: http.StatusConflict, Body: errorBody{Error: "journal", Message: err.Error()}}
-			}
-			return decision{Status: http.StatusInternalServerError, Body: errorBody{Error: "internal", Message: "could not discard hold"}}
+			return decision{Status: http.StatusBadRequest, Body: errorBody{Error: code, Message: message}}
+		}
+		if err := s.archives.DiscardHold(inst, s.mod, hold, size, modTime); err != nil {
+			return holdDecision(err)
 		}
 		return decision{Status: http.StatusOK, Body: map[string]any{"action": "discard-hold", "path": hold}}
 	})
@@ -397,18 +400,18 @@ func (s *Server) postJournal(w http.ResponseWriter, r *http.Request) {
 				backup.JournalView
 			}{Action: "journal-preview", JournalView: view}}
 		}
-		op, err := journalOp(body)
+		op, restoreID, force, err := journalRequest(body)
 		if err != nil {
 			return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "invalid_body", Message: "body must be JSON"}}
 		}
 		switch op {
 		case "rollback":
-			if err := s.archives.RollbackJournal(inst, s.mod); err != nil {
+			if err := s.archives.RollbackJournal(inst, s.mod, restoreID); err != nil {
 				return journalDecision(err)
 			}
 			return decision{Status: http.StatusOK, Body: map[string]any{"action": "journal-rollback"}}
 		case "discard":
-			if err := s.archives.DiscardJournal(inst); err != nil {
+			if err := s.archives.DiscardJournal(inst, s.mod, force, restoreID); err != nil {
 				return journalDecision(err)
 			}
 			return decision{Status: http.StatusOK, Body: map[string]any{"action": "journal-discard"}}
@@ -430,20 +433,73 @@ func journalDecision(err error) decision {
 	if errors.Is(err, backup.ErrNotFound) {
 		return decision{Status: http.StatusNotFound, Body: errorBody{Error: "not_found", Message: "no restore journal"}}
 	}
+	if errors.Is(err, backup.ErrRollbackRequired) {
+		return decision{Status: http.StatusConflict, Body: errorBody{Error: "rollback_required", Message: "roll the restore back before discarding its journal"}}
+	}
+	if errors.Is(err, backup.ErrRestoreIDRequired) {
+		return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "restore_id_required", Message: "rollback requires the restore id from the preview"}}
+	}
+	if errors.Is(err, backup.ErrRestoreIDAck) {
+		return decision{Status: http.StatusConflict, Body: errorBody{Error: "restore_id_mismatch", Message: "restore id acknowledgement does not match"}}
+	}
 	if errors.Is(err, backup.ErrJournal) || errors.Is(err, backup.ErrJournalAuth) || errors.Is(err, backup.ErrMissingHold) {
 		return decision{Status: http.StatusConflict, Body: errorBody{Error: "journal", Message: err.Error()}}
 	}
 	return decision{Status: http.StatusInternalServerError, Body: errorBody{Error: "internal", Message: "could not update restore journal"}}
 }
 
-func journalOp(body []byte) (string, error) {
+func holdDecision(err error) decision {
+	if errors.Is(err, backup.ErrInvalidHold) {
+		return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "invalid_hold", Message: "not a restore hold"}}
+	}
+	if errors.Is(err, backup.ErrNotFound) {
+		return decision{Status: http.StatusNotFound, Body: errorBody{Error: "not_found", Message: "unknown hold"}}
+	}
+	if errors.Is(err, backup.ErrHoldInUse) {
+		return decision{Status: http.StatusConflict, Body: errorBody{Error: "hold_in_use", Message: "hold is named by the restore journal"}}
+	}
+	if errors.Is(err, backup.ErrHoldChanged) {
+		return decision{Status: http.StatusConflict, Body: errorBody{Error: "hold_changed", Message: "hold size or modification time does not match the preview"}}
+	}
+	if errors.Is(err, backup.ErrMidRestore) {
+		return decision{Status: http.StatusConflict, Body: errorBody{Error: "mid_restore", Message: "destination looks mid-restore"}}
+	}
+	if errors.Is(err, backup.ErrJournal) || errors.Is(err, backup.ErrJournalAuth) {
+		return decision{Status: http.StatusConflict, Body: errorBody{Error: "journal", Message: err.Error()}}
+	}
+	return decision{Status: http.StatusInternalServerError, Body: errorBody{Error: "internal", Message: "could not discard hold"}}
+}
+
+func journalRequest(body []byte) (string, string, bool, error) {
 	var payload struct {
-		Op string `json:"op"`
+		Op        string `json:"op"`
+		RestoreID string `json:"restoreID"`
+		Force     bool   `json:"force"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return "", err
+		return "", "", false, err
 	}
-	return payload.Op, nil
+	return payload.Op, payload.RestoreID, payload.Force, nil
+}
+
+var errInvalidModTime = errors.New("invalid modTime")
+
+func holdStatAck(body []byte) (int64, time.Time, error) {
+	var payload struct {
+		Size    *int64 `json:"size"`
+		ModTime string `json:"modTime"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return 0, time.Time{}, err
+	}
+	if payload.Size == nil || strings.TrimSpace(payload.ModTime) == "" {
+		return 0, time.Time{}, errors.New("missing hold stat")
+	}
+	mod, err := time.Parse(time.RFC3339Nano, payload.ModTime)
+	if err != nil {
+		return 0, time.Time{}, errInvalidModTime
+	}
+	return *payload.Size, mod, nil
 }
 
 func (s *Server) postReleaseBackup(w http.ResponseWriter, r *http.Request) {
