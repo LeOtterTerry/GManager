@@ -11,3 +11,5 @@ func renameOnce(oldpath, newpath string) error {
 func isSharingViolation(error) bool { return false }
 
 func isAccessDenied(error) bool { return false }
+
+func isLockViolation(error) bool { return false }

@@ -2,59 +2,78 @@ package backup
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
-	"strconv"
-	"strings"
 
 	"github.com/LeOtterTerry/GManager/agent/internal/core"
 )
 
 const (
-	holdPrefix    = ".gmanager-hold-"
-	restorePrefix = ".gmanager-restore-"
-	migratePrefix = ".gmanager-migrate-"
-	undoSuffix    = ".gmanager-undo"
+	holdPrefix = ".gmanager-hold-"
+	undoSuffix = ".gmanager-undo"
 )
 
-// Recover puts interrupted restores back together. A hold is the previous
-// copy of a file or directory. When the destination is missing, the
-// lowest-numbered hold is renamed back. When the destination is present, the
-// swap committed and leftover holds are removed. Staging directories and
-// undo junk are removed once the destination is in place. This runs at
-// process start and at the beginning of a restore, not during a rollback.
+// Recover finishes or rolls back a restore journal in the directories it is
+// given. A pending journal puts every recorded target back from its hold. A
+// committed journal deletes only the holds it names. Holds that no journal
+// names are reported and left in place. Staging directories are removed only
+// when the journal lists them. Parent directories are not scanned.
 func Recover(paths ...string) error {
-	seen := map[string]struct{}{}
-	var err error
-	for _, path := range paths {
-		if path == "" {
+	dirs, err := recoverDirs(paths)
+	known := map[string]struct{}{}
+	scan := map[string]struct{}{}
+	for _, dir := range dirs {
+		scan[dir] = struct{}{}
+	}
+	var journals []string
+	for _, dir := range dirs {
+		j, rerr := readJournal(dir)
+		if errors.Is(rerr, os.ErrNotExist) {
 			continue
 		}
-		abs, absErr := filepath.Abs(path)
-		if absErr != nil {
-			err = errors.Join(err, absErr)
+		if rerr != nil {
+			err = errors.Join(err, rerr)
 			continue
 		}
-		dirs := []string{filepath.Dir(abs)}
-		info, statErr := os.Lstat(abs)
-		if statErr == nil && info.IsDir() {
-			dirs = append([]string{abs}, dirs...)
-		} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
-			err = errors.Join(err, statErr)
+		noteJournal(j, known, scan)
+		journals = append(journals, dir)
+	}
+	for _, dir := range journals {
+		if rerr := rollbackJournal(dir); rerr != nil {
+			err = errors.Join(err, rerr)
+		}
+	}
+	for dir := range scan {
+		found, scanErr := unjournaledHolds(dir, known)
+		if scanErr != nil {
+			err = errors.Join(err, scanErr)
 			continue
 		}
-		for _, dir := range dirs {
-			if _, ok := seen[dir]; ok {
-				continue
-			}
-			seen[dir] = struct{}{}
-			if recErr := recoverDir(dir); recErr != nil {
-				err = errors.Join(err, recErr)
-			}
+		for _, hold := range found {
+			err = errors.Join(err, fmt.Errorf("%w: %s", ErrUnjournaledHold, hold))
 		}
 	}
 	return err
+}
+
+func noteJournal(j journalFile, known, scan map[string]struct{}) {
+	for _, target := range j.Targets {
+		if target.Hold != "" {
+			hold := filepath.Clean(target.Hold)
+			known[hold] = struct{}{}
+			scan[filepath.Dir(hold)] = struct{}{}
+		}
+		if target.Dest != "" {
+			scan[filepath.Dir(filepath.Clean(target.Dest))] = struct{}{}
+		}
+	}
+	for _, path := range j.Staging {
+		if path == "" {
+			continue
+		}
+		scan[filepath.Dir(filepath.Clean(path))] = struct{}{}
+	}
 }
 
 func recoverInstance(inst core.Instance, mod core.GameModule) error {
@@ -70,118 +89,45 @@ func recoverInstance(inst core.Instance, mod core.GameModule) error {
 	return Recover(paths...)
 }
 
-type holdCand struct {
-	n    int
-	path string
+func recoverDirs(paths []string) ([]string, error) {
+	seen := map[string]struct{}{}
+	var dirs []string
+	var err error
+	for _, path := range paths {
+		dir, ok, convErr := recoverDir(path)
+		if convErr != nil {
+			err = errors.Join(err, convErr)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		if _, dup := seen[dir]; dup {
+			continue
+		}
+		seen[dir] = struct{}{}
+		dirs = append(dirs, dir)
+	}
+	return dirs, err
 }
 
-func recoverDir(dir string) error {
-	entries, err := os.ReadDir(dir)
+func recoverDir(path string) (string, bool, error) {
+	if path == "" {
+		return "", false, nil
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", false, err
+	}
+	info, err := os.Lstat(abs)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return "", false, nil
 	}
 	if err != nil {
-		return err
+		return "", false, err
 	}
-	var staging []string
-	holds := map[string][]holdCand{}
-	undos := map[string]string{}
-	for _, entry := range entries {
-		name := entry.Name()
-		full := filepath.Join(dir, name)
-		if strings.HasPrefix(name, restorePrefix) || strings.HasPrefix(name, migratePrefix) {
-			staging = append(staging, full)
-			continue
-		}
-		if strings.HasSuffix(name, undoSuffix) {
-			base := strings.TrimSuffix(name, undoSuffix)
-			if base != "" {
-				undos[base] = full
-			}
-			continue
-		}
-		if strings.HasPrefix(name, holdPrefix) {
-			base, n := splitHold(strings.TrimPrefix(name, holdPrefix))
-			if base == "" {
-				continue
-			}
-			holds[base] = append(holds[base], holdCand{n: n, path: full})
-		}
+	if info.IsDir() {
+		return abs, true, nil
 	}
-	for _, path := range staging {
-		if rmErr := os.RemoveAll(path); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
-			return rmErr
-		}
-	}
-	bases := map[string]struct{}{}
-	for base := range holds {
-		bases[base] = struct{}{}
-	}
-	for base := range undos {
-		bases[base] = struct{}{}
-	}
-	for base := range bases {
-		if err := recoverOne(filepath.Join(dir, base), holds[base], undos[base]); err != nil {
-			return err
-		}
-	}
-	if len(staging) == 0 && len(bases) == 0 {
-		return nil
-	}
-	return syncDir(dir)
-}
-
-func recoverOne(dest string, holds []holdCand, undo string) error {
-	sort.Slice(holds, func(i, j int) bool { return holds[i].n < holds[j].n })
-	_, err := os.Lstat(dest)
-	missing := errors.Is(err, os.ErrNotExist)
-	if err != nil && !missing {
-		return err
-	}
-	if missing && len(holds) > 0 {
-		if err := renameRetry(holds[0].path, dest); err != nil {
-			return err
-		}
-		holds = holds[1:]
-		missing = false
-	}
-	if missing && undo != "" {
-		if err := renameRetry(undo, dest); err != nil {
-			return err
-		}
-		undo = ""
-		missing = false
-	}
-	if missing {
-		return nil
-	}
-	for _, hold := range holds {
-		if err := os.RemoveAll(hold.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
-	if undo != "" {
-		if err := os.RemoveAll(undo); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
-	return nil
-}
-
-func splitHold(rest string) (string, int) {
-	i := strings.LastIndex(rest, ".")
-	if i <= 0 || i == len(rest)-1 {
-		return rest, 0
-	}
-	num := rest[i+1:]
-	for _, c := range num {
-		if c < '0' || c > '9' {
-			return rest, 0
-		}
-	}
-	n, err := strconv.Atoi(num)
-	if err != nil {
-		return rest, 0
-	}
-	return rest[:i], n
+	return filepath.Dir(abs), true, nil
 }

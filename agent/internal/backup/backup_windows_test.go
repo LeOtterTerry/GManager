@@ -5,8 +5,10 @@ package backup
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -104,6 +106,45 @@ func TestWindowsRestoreLockedSaveFile(t *testing.T) {
 	}
 }
 
-func TestWindowsCaseCollidingZipEntries(t *testing.T) {
-	TestCaseCollidingZipEntries(t)
+func TestWindowsRestoreCaseCollidingEntries(t *testing.T) {
+	inst, mod, save := newWorld(t)
+	writeSave(t, save, "world.dat", "live")
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a.dat")
+	b := filepath.Join(dir, "b.dat")
+	if err := os.WriteFile(a, []byte("A"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(b, []byte("B"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	id := "20261015T120000.000000000Z"
+	man := Manifest{
+		Version:    manifestVer,
+		ID:         id,
+		CreatedAt:  time.Now().UTC(),
+		InstanceID: "default",
+		GameID:     "plainsofpain",
+		Kind:       KindManual,
+		Saves:      []SaveRoot{{Index: 0}},
+	}
+	files := []sourceFile{
+		{abs: a, entry: ManifestFile{Path: "saves/0/World.dat", Role: roleSave, Root: 0, Rel: "World.dat"}},
+		{abs: b, entry: ManifestFile{Path: "saves/0/world.dat", Role: roleSave, Root: 0, Rel: "world.dat"}},
+	}
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), Keep: 2, Key: testKey()}
+	if err := os.MkdirAll(store.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	zipPath := filepath.Join(store.Dir, id+".zip")
+	if _, err := writeZip(zipPath, man, files, testKey()); err != nil {
+		t.Fatal(err)
+	}
+	err := store.Restore(context.Background(), id, inst, mod)
+	if !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), "case-colliding") {
+		t.Fatalf("err = %v", err)
+	}
+	if got := readSave(t, save, "world.dat"); got != "live" {
+		t.Fatalf("world = %q", got)
+	}
 }

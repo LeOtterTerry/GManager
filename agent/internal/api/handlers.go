@@ -244,6 +244,79 @@ func (s *Server) postDiscardBackup(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) postSignBackup(w http.ResponseWriter, r *http.Request) {
+	s.postArchiveConfirm(w, r, "sign", "sign requires confirm=true", "sign requires a backup id", func(id string) error {
+		return s.archives.Sign(id)
+	}, func(err error) decision {
+		if errors.Is(err, backup.ErrIntegrity) {
+			return decision{Status: http.StatusConflict, Body: errorBody{Error: "integrity", Message: "backup failed integrity check"}}
+		}
+		return decision{}
+	})
+}
+
+func (s *Server) postReleaseBackup(w http.ResponseWriter, r *http.Request) {
+	s.postArchiveConfirm(w, r, "release", "release requires confirm=true", "release requires a backup id", func(id string) error {
+		return s.archives.Release(id)
+	}, func(err error) decision {
+		if errors.Is(err, backup.ErrNotQuarantined) {
+			return decision{Status: http.StatusConflict, Body: errorBody{Error: "not_quarantined", Message: "only a quarantined backup can be released"}}
+		}
+		if errors.Is(err, backup.ErrLiveBackup) {
+			return decision{Status: http.StatusConflict, Body: errorBody{Error: "live_backup", Message: "a live backup with that id already exists"}}
+		}
+		if errors.Is(err, backup.ErrAmbiguousQuarantine) {
+			return decision{Status: http.StatusConflict, Body: errorBody{Error: "ambiguous_quarantine", Message: "more than one quarantined copy"}}
+		}
+		return decision{}
+	})
+}
+
+func (s *Server) postArchiveConfirm(w http.ResponseWriter, r *http.Request, action, confirmMsg, idMsg string, fn func(string) error, extra func(error) decision) {
+	if !s.knownInstance(w, r) {
+		return
+	}
+	body, err := readBody(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: "invalid_body", Message: bodyReadMessage(err)})
+		return
+	}
+	s.accept(w, r, body, func() decision {
+		ok, err := confirmed(body)
+		if err != nil {
+			return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "invalid_body", Message: "body must be JSON"}}
+		}
+		if !ok {
+			return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "confirm_required", Message: confirmMsg}}
+		}
+		id, err := backupID(body)
+		if err != nil {
+			return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "backup_id_required", Message: idMsg}}
+		}
+		if s.archives == nil {
+			return decision{Status: http.StatusNotImplemented, Body: errorBody{
+				Error:   "not_implemented",
+				Message: "backup directory is not configured",
+			}}
+		}
+		if err := fn(id); err != nil {
+			if errors.Is(err, backup.ErrInvalidID) {
+				return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "invalid_backup_id", Message: "invalid backup id"}}
+			}
+			if errors.Is(err, backup.ErrNotFound) {
+				return decision{Status: http.StatusNotFound, Body: errorBody{Error: "not_found", Message: "unknown backup"}}
+			}
+			if extra != nil {
+				if d := extra(err); d.Status != 0 {
+					return d
+				}
+			}
+			return decision{Status: http.StatusInternalServerError, Body: errorBody{Error: "internal", Message: "could not " + action + " backup"}}
+		}
+		return decision{Status: http.StatusOK, Body: map[string]any{"action": action, "id": id}}
+	})
+}
+
 func (s *Server) getBackups(w http.ResponseWriter, r *http.Request) {
 	if !s.knownInstance(w, r) {
 		return
@@ -423,9 +496,7 @@ func (s *Server) restoreWork(ctx context.Context, id string, useArchived bool) (
 	if err := s.archives.Verify(safety.ID); err != nil {
 		return nil, s.finishStopped(wasRunning, fmt.Errorf("safety backup %s failed verification: %w", safety.ID, err))
 	}
-	s.archives.AdaptConfig = s.alignSaveDir(dest.UserDir)
-	defer func() { s.archives.AdaptConfig = nil }()
-	if err := s.archives.RestoreInto(ctx, id, dest, s.mod, safety.ID); err != nil {
+	if err := s.archives.RestoreInto(ctx, id, dest, s.mod, safety.ID, s.alignSaveDir(dest.UserDir)); err != nil {
 		return nil, s.finishStopped(wasRunning, fmt.Errorf("safety backup %s was kept: %w", safety.ID, err))
 	}
 	if _, err := s.editor.Acknowledge(); err != nil {

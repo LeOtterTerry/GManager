@@ -57,16 +57,21 @@ var (
 	ErrInvalidCursor = errors.New("invalid cursor")
 	// ErrServerRunning means a backup was asked for while the process was up.
 	ErrServerRunning = errors.New("server is running")
-	// ErrUnsigned means the manifest has no HMAC. Hashes can still be checked,
-	// and a matching archive can be signed in place.
+	// ErrUnsigned means the manifest has no HMAC. Hashes can still be checked.
+	// Listing reports the zip as unsigned. Restore refuses it until Sign.
 	ErrUnsigned = errors.New("backup manifest is unsigned")
 	// ErrKeyMissing means backups are already on disk and every copy of the
 	// HMAC key is gone. A new key is not created, because it would fail every
 	// existing archive.
 	ErrKeyMissing = errors.New("backup integrity key is missing and backups already exist")
-	// ErrNotQuarantined means Discard was asked to delete a backup that is
-	// still a normal zip. Only a quarantined archive can be deleted that way.
+	// ErrNotQuarantined means Discard or Release was asked to act on a backup
+	// that is still a normal zip.
 	ErrNotQuarantined = errors.New("backup is not quarantined")
+	// ErrLiveBackup means Release was asked to restore a quarantine name
+	// while that id still has a live zip.
+	ErrLiveBackup = errors.New("a live backup with that id already exists")
+	// ErrAmbiguousQuarantine means more than one quarantine file matches the id.
+	ErrAmbiguousQuarantine = errors.New("more than one quarantined copy")
 )
 
 // Entry is one backup as the list API returns it.
@@ -82,6 +87,9 @@ type Entry struct {
 	// Corrupt is true when the zip could not be read. One bad zip does not
 	// fail the list.
 	Corrupt bool `json:"corrupt,omitempty"`
+	// Unsigned is true when the manifest hashes match and the HMAC is empty.
+	// Restore refuses the zip until an operator signs it.
+	Unsigned bool `json:"unsigned,omitempty"`
 	// Quarantined is true when the zip was set aside because it could not be
 	// classified. Retention does not delete it. Discard does, and only then.
 	Quarantined bool `json:"quarantined,omitempty"`
@@ -109,21 +117,23 @@ type Store struct {
 	// uses KeyPath, which is never stored inside a zip.
 	Key []byte
 	// KeyPath is an owner-only file of at least 32 bytes outside the backup
-	// directory. Copies are kept at KeyPath+".bak" and <Dir>/integrity.key.
-	// A missing key is created only when no backup is on disk yet. If a zip
-	// or a quarantined zip is already there and every copy is gone, calls
-	// fail with ErrKeyMissing instead of minting a key that would reject them.
+	// directory. Copies are kept at KeyPath+".bak" and beside KeyPath as
+	// integrity.key. A missing key is created only when no backup is on disk
+	// yet. If a zip or a quarantined zip is already there and every copy is
+	// gone, calls fail with ErrKeyMissing instead of minting a key that would
+	// reject them.
 	KeyPath string
 
 	keyMu     sync.Mutex
-	migMu     sync.Mutex
 	loadedKey []byte
+	// mu guards quarantine, discard, release, sign, and prune.
+	mu sync.Mutex
 	// swapFail, when set, runs before each live swap during restore.
 	// Tests use it to force a partial swap. Production leaves it nil.
 	swapFail func() error
-	// AdaptConfig, when set, may rewrite a verified config file before it is
-	// swapped into place. A returned error refuses the restore before any swap.
-	AdaptConfig func(rel string, body []byte) ([]byte, error)
+	// hookQuarantine, when set, runs at the start of quarantine while mu is
+	// held. Tests use it to prove callers share that mutex.
+	hookQuarantine func()
 
 	cacheMu sync.Mutex
 	cache   map[string]zipCacheEntry
@@ -321,21 +331,9 @@ func (s *Store) openVerified(id string) (*archive, error) {
 	}
 	if a.unsigned {
 		if closeErr := a.Close(); closeErr != nil {
-			return nil, closeErr
+			return nil, errors.Join(ErrUnsigned, closeErr)
 		}
-		if err := s.migrateUnsigned(id); err != nil {
-			return nil, err
-		}
-		a, err = openArchive(path, openOpts{hash: true, mac: true, key: key})
-		if err != nil {
-			return nil, err
-		}
-		if a.unsigned {
-			if closeErr := a.Close(); closeErr != nil {
-				return nil, errors.Join(ErrUnsigned, closeErr)
-			}
-			return nil, ErrUnsigned
-		}
+		return nil, ErrUnsigned
 	}
 	if a.man.ID != id {
 		if closeErr := a.Close(); closeErr != nil {
@@ -559,8 +557,13 @@ type zipMeta struct {
 	created      time.Time
 	files        int
 	verified     bool
+	unsigned     bool
 	unclassified bool
 }
+
+// classifyOpenHook, when set, runs before each archive open on the classify
+// path. Tests use it to force one transient failure. Production leaves it nil.
+var classifyOpenHook func() error
 
 type zipCacheEntry struct {
 	size int64
@@ -569,6 +572,8 @@ type zipCacheEntry struct {
 }
 
 func (s *Store) prune(protect []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	inv, err := s.inventory()
 	if err != nil {
 		return err
@@ -581,7 +586,7 @@ func (s *Store) prune(protect []string) error {
 	keep := map[string]struct{}{}
 	byKind := map[string][]zipMeta{}
 	for _, z := range inv {
-		if z.unclassified || z.kind == "" {
+		if z.unclassified || z.unsigned || z.kind == "" {
 			continue
 		}
 		byKind[z.kind] = append(byKind[z.kind], z)
@@ -620,8 +625,12 @@ func (s *Store) prune(protect []string) error {
 		if _, ok := protected[z.id]; ok {
 			continue
 		}
-		// An archive we cannot classify is never deleted. It is renamed aside
-		// so a later explicit Discard is the only way to remove it.
+		// An unsigned archive stays a zip until an operator signs or replaces
+		// it. An archive we cannot classify is never deleted. It is renamed
+		// aside so a later explicit Discard is the only way to remove it.
+		if z.unsigned {
+			continue
+		}
 		if z.unclassified || !z.verified || z.kind == "" {
 			if err := s.quarantine(z.id); err != nil {
 				return err
@@ -687,44 +696,45 @@ func (s *Store) classifyCached(id string, key []byte) (zipMeta, error) {
 
 func (s *Store) classify(path, id string, key []byte) zipMeta {
 	unknown := zipMeta{id: id, unclassified: true}
-	a, err := openArchive(path, openOpts{hash: true, mac: true, key: key})
+	a, err := s.openForClassify(path, key)
 	if err != nil {
+		a, err = s.openForClassify(path, key)
+		if err != nil {
+			return unknown
+		}
+	}
+	meta, ok := metaFromArchive(a, id)
+	if closeErr := a.Close(); closeErr != nil || !ok {
 		return unknown
 	}
-	if a.unsigned {
-		if a.man.ID != id {
-			if closeErr := a.Close(); closeErr != nil {
-				return unknown
-			}
-			return unknown
-		}
-		if closeErr := a.Close(); closeErr != nil {
-			return unknown
-		}
-		if err := s.migrateUnsigned(id); err != nil {
-			return unknown
-		}
-		a, err = openArchive(path, openOpts{hash: true, mac: true, key: key})
-		if err != nil || a.unsigned {
-			if a != nil {
-				if closeErr := a.Close(); closeErr != nil {
-					return unknown
-				}
-			}
-			return unknown
+	return meta
+}
+
+func (s *Store) openForClassify(path string, key []byte) (*archive, error) {
+	if classifyOpenHook != nil {
+		if err := classifyOpenHook(); err != nil {
+			return nil, err
 		}
 	}
-	if closeErr := a.Close(); closeErr != nil || a.man.ID != id || !validKind(a.man.Kind) {
-		return unknown
+	return openArchive(path, openOpts{hash: true, mac: true, key: key})
+}
+
+func metaFromArchive(a *archive, id string) (zipMeta, bool) {
+	if a == nil || a.man.ID != id || !validKind(a.man.Kind) {
+		return zipMeta{}, false
 	}
-	return zipMeta{
+	meta := zipMeta{
 		id:       id,
 		kind:     a.man.Kind,
 		instance: a.man.InstanceID,
 		created:  a.man.CreatedAt.UTC(),
 		files:    len(a.man.Files),
-		verified: true,
+		unsigned: a.unsigned,
 	}
+	if !a.unsigned {
+		meta.verified = true
+	}
+	return meta, true
 }
 
 func (s *Store) cached(id string, info os.FileInfo) (zipMeta, bool) {
@@ -783,9 +793,6 @@ func (s *Store) ids() ([]string, error) {
 }
 
 func (s *Store) entries() ([]Entry, error) {
-	if err := s.sweepPartial(); err != nil {
-		return nil, err
-	}
 	ids, err := s.ids()
 	if err != nil {
 		return nil, err
@@ -797,7 +804,7 @@ func (s *Store) entries() ([]Entry, error) {
 	if len(ids) == 0 && len(quar) == 0 {
 		return nil, nil
 	}
-	key, err := s.integrityKey()
+	key, err := s.readIntegrityKey()
 	if err != nil {
 		return nil, err
 	}
@@ -814,6 +821,19 @@ func (s *Store) entries() ([]Entry, error) {
 		info, err := os.Stat(path)
 		if err != nil {
 			return nil, err
+		}
+		if meta.unsigned {
+			out = append(out, Entry{
+				Cursor:     id,
+				ID:         id,
+				CreatedAt:  meta.created,
+				Bytes:      info.Size(),
+				FileCount:  meta.files,
+				Kind:       meta.kind,
+				InstanceID: meta.instance,
+				Unsigned:   true,
+			})
+			continue
 		}
 		if meta.unclassified || !meta.verified {
 			out = append(out, corruptEntry(id, info))
@@ -852,6 +872,8 @@ func (s *Store) Discard(id string) error {
 	if s == nil || s.Dir == "" {
 		return errors.New("backup directory is not configured")
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !validID(id) {
 		return ErrInvalidID
 	}
@@ -965,11 +987,61 @@ func (s *Store) integrityKey() ([]byte, error) {
 }
 
 func (s *Store) keyPaths() []string {
+	if s.KeyPath == "" {
+		return nil
+	}
 	paths := []string{s.KeyPath, s.KeyPath + ".bak"}
-	if s.Dir != "" {
-		paths = append(paths, filepath.Join(s.Dir, "integrity.key"))
+	side := filepath.Join(filepath.Dir(s.KeyPath), "integrity.key")
+	if side != s.KeyPath && side != s.KeyPath+".bak" {
+		paths = append(paths, side)
 	}
 	return paths
+}
+
+// readIntegrityKey returns a key already in memory or on disk. It does not
+// create a key, rewrite a copy, or change file permissions.
+func (s *Store) readIntegrityKey() ([]byte, error) {
+	if len(s.Key) >= 32 {
+		return append([]byte(nil), s.Key...), nil
+	}
+	s.keyMu.Lock()
+	defer s.keyMu.Unlock()
+	if len(s.loadedKey) >= 32 {
+		return append([]byte(nil), s.loadedKey...), nil
+	}
+	if s.KeyPath == "" {
+		return nil, errors.New("backup integrity key is not configured")
+	}
+	var found []byte
+	for _, path := range s.keyPaths() {
+		b, err := os.ReadFile(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if len(b) < 32 {
+			continue
+		}
+		if found != nil && !bytes.Equal(found, b) {
+			return nil, errors.New("backup integrity key copies disagree")
+		}
+		if found == nil {
+			found = append([]byte(nil), b...)
+		}
+	}
+	if found == nil {
+		present, err := s.hasArchives()
+		if err != nil {
+			return nil, err
+		}
+		if present {
+			return nil, ErrKeyMissing
+		}
+		return nil, errors.New("backup integrity key is not configured")
+	}
+	return append([]byte(nil), found...), nil
 }
 
 func (s *Store) ensureKeyCopy(path string, key []byte) error {
@@ -1113,6 +1185,9 @@ func quarantineNameID(name string) (string, bool) {
 }
 
 func (s *Store) quarantine(id string) error {
+	if s.hookQuarantine != nil {
+		s.hookQuarantine()
+	}
 	src, err := s.zipPath(id)
 	if err != nil {
 		return err
@@ -1142,13 +1217,68 @@ func (s *Store) quarantine(id string) error {
 	return errors.New("could not quarantine backup")
 }
 
-// migrateUnsigned rewrites a hash-valid archive that has an empty HMAC.
-// A wrong HMAC is not migrated. Anyone who can already replace files in the
-// backup directory could strip the HMAC; the hash check still runs first, so
-// a stripped HMAC with edited hashes is rejected.
-func (s *Store) migrateUnsigned(id string) error {
-	s.migMu.Lock()
-	defer s.migMu.Unlock()
+// Sign rewrites a hash-valid archive that has an empty HMAC. The caller has
+// to ask for it. A wrong HMAC is not signed. Listing and restore do not call
+// this.
+func (s *Store) Sign(id string) error {
+	if s == nil || s.Dir == "" {
+		return errors.New("backup directory is not configured")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !validID(id) {
+		return ErrInvalidID
+	}
+	if err := s.Exists(id); err != nil {
+		return err
+	}
+	return s.signLocked(id)
+}
+
+// Release renames one quarantined archive back to a live zip.
+func (s *Store) Release(id string) error {
+	if s == nil || s.Dir == "" {
+		return errors.New("backup directory is not configured")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !validID(id) {
+		return ErrInvalidID
+	}
+	matches, err := s.quarantinePaths(id)
+	if err != nil {
+		return err
+	}
+	if len(matches) == 0 {
+		if err := s.Exists(id); err == nil {
+			return ErrNotQuarantined
+		} else if errors.Is(err, ErrNotFound) {
+			return ErrNotFound
+		} else if err != nil {
+			return err
+		}
+		return ErrNotFound
+	}
+	if len(matches) != 1 {
+		return ErrAmbiguousQuarantine
+	}
+	dest, err := s.zipPath(id)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Lstat(dest); err == nil {
+		return ErrLiveBackup
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := renameRetry(matches[0], dest); err != nil {
+		return err
+	}
+	s.dropCache(id)
+	return syncDir(s.Dir)
+}
+
+func (s *Store) signLocked(id string) error {
 	path, err := s.zipPath(id)
 	if err != nil {
 		return err

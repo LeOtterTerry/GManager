@@ -38,6 +38,10 @@ func isAccessDenied(err error) bool {
 	return errors.Is(err, windows.ERROR_ACCESS_DENIED)
 }
 
+func isLockViolation(err error) bool {
+	return errors.Is(err, windows.ERROR_LOCK_VIOLATION)
+}
+
 // extendedPath opts into the long-path form so a rename past MAX_PATH works
 // without a manifest change. Both sides of MoveFileEx must use it.
 func extendedPath(path string) (string, error) {

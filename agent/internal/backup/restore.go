@@ -43,15 +43,18 @@ func (s *Store) Config(id, rel string) ([]byte, error) {
 // which must already be the directory the operator chose. Verification
 // finishes before the first write. A hash mismatch leaves the live files alone.
 func (s *Store) Restore(ctx context.Context, id string, inst core.Instance, mod core.GameModule) error {
-	return s.RestoreInto(ctx, id, inst, mod, "")
+	return s.RestoreInto(ctx, id, inst, mod, "", nil)
 }
 
 // RestoreInto is Restore with an automatic rollback. safetyID is a backup of
 // the destination taken before this call and already verified by the caller.
-// Staging is cancellable. Once the swaps start, cancellation is ignored. If a
-// swap fails and safetyID is set, that backup is written back over the
-// destination.
-func (s *Store) RestoreInto(ctx context.Context, id string, inst core.Instance, mod core.GameModule, safetyID string) error {
+// adapt, when set, may rewrite a verified config file before it is swapped
+// into place. A returned error refuses the restore before any swap. Staging
+// is cancellable. Once the swaps start, cancellation is ignored. A journal is
+// fsynced before the first swap. If a swap fails, previous files are renamed
+// back from their holds. safetyID is written back only when that rename fails
+// and those holds are already gone.
+func (s *Store) RestoreInto(ctx context.Context, id string, inst core.Instance, mod core.GameModule, safetyID string, adapt func(string, []byte) ([]byte, error)) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -89,7 +92,7 @@ func (s *Store) RestoreInto(ctx context.Context, id string, inst core.Instance, 
 	if err != nil {
 		return err
 	}
-	staged, err := stageAll(ctx, a, plan, s.AdaptConfig)
+	staged, err := stageAll(ctx, a, plan, adapt)
 	if err != nil {
 		if discardErr := staged.discard(); discardErr != nil {
 			return errors.Join(err, discardErr)
@@ -102,31 +105,34 @@ func (s *Store) RestoreInto(ctx context.Context, id string, inst core.Instance, 
 		}
 		return err
 	}
-	// Swaps are the point of no return for cancellation. A failure puts the
-	// previous names back with undo first. The safety zip is used only when
-	// that rename-back fails. Hold folders stay until that rollback commits.
-	if err := s.commit(staged); err != nil {
+	// Swaps are the point of no return for cancellation. The journal is
+	// durable before the first rename. A failure puts the previous names back
+	// from their holds. The safety zip is used only when that rename-back
+	// fails and the holds are already gone. Holds named by a pending journal
+	// stay on disk so the next recovery can roll them back.
+	journalDir := inst.Dir
+	if err := s.commit(staged, journalDir); err != nil {
+		if journalIsCommitted(journalDir) {
+			return err
+		}
 		undoErr := staged.undo()
 		if discardErr := staged.discard(); discardErr != nil {
 			undoErr = errors.Join(undoErr, discardErr)
 		}
 		if undoErr == nil {
+			if rmErr := removeJournal(journalDir); rmErr != nil {
+				return errors.Join(err, rmErr)
+			}
 			return err
 		}
-		if safety != nil && staged.dirty {
-			rbErr := s.apply(safety, plan)
-			if rbErr != nil {
-				return fmt.Errorf("%w; undo failed: %v; rollback from safety backup %s failed: %v", err, undoErr, safetyID, rbErr)
-			}
-			if holdErr := staged.removeHolds(); holdErr != nil {
-				return fmt.Errorf("%w; rolled back from safety backup %s; removing the previous copy failed: %v", err, safetyID, holdErr)
-			}
-			return fmt.Errorf("%w; rolled back from safety backup %s", err, safetyID)
+		if journalHoldsExist(journalDir) || safety == nil || !staged.dirty {
+			return errors.Join(err, undoErr)
 		}
-		return errors.Join(err, undoErr)
-	}
-	if err := staged.removeHolds(); err != nil {
-		return fmt.Errorf("restored files are in place, removing the previous copy failed: %w", err)
+		rbErr := s.apply(safety, plan, journalDir)
+		if rbErr != nil {
+			return fmt.Errorf("%w; undo failed: %v; rollback from safety backup %s failed: %v", err, undoErr, safetyID, rbErr)
+		}
+		return fmt.Errorf("%w; rolled back from safety backup %s", err, safetyID)
 	}
 	return nil
 }
@@ -356,13 +362,28 @@ func rewriteFile(path string, body []byte) error {
 	return cerr
 }
 
-func (s *Store) commit(st *stagedSet) error {
+func (s *Store) commit(st *stagedSet, journalDir string) error {
+	if err := assignHolds(st); err != nil {
+		return err
+	}
+	if err := writeJournal(journalDir, journalFrom(st, journalPending)); err != nil {
+		return err
+	}
+	if err := s.swapAll(st); err != nil {
+		return err
+	}
+	return commitJournal(journalDir, st)
+}
+
+func (s *Store) swapAll(st *stagedSet) error {
 	for i := range st.dirs {
 		if err := s.beforeSwap(); err != nil {
 			return err
 		}
-		hold, err := swapPath(st.dirs[i].dest, st.dirs[i].tmp, true)
-		st.dirs[i].hold = hold
+		hold, err := swapPath(st.dirs[i].dest, st.dirs[i].tmp, st.dirs[i].hold, true)
+		if hold != "" {
+			st.dirs[i].hold = hold
+		}
 		if err != nil {
 			if hold != "" {
 				st.dirty = true
@@ -376,8 +397,10 @@ func (s *Store) commit(st *stagedSet) error {
 		if err := s.beforeSwap(); err != nil {
 			return err
 		}
-		hold, err := swapPath(st.files[i].dest, st.files[i].tmp, false)
-		st.files[i].hold = hold
+		hold, err := swapPath(st.files[i].dest, st.files[i].tmp, st.files[i].hold, false)
+		if hold != "" {
+			st.files[i].hold = hold
+		}
 		if err != nil {
 			if hold != "" {
 				st.dirty = true
@@ -397,7 +420,7 @@ func (s *Store) beforeSwap() error {
 	return s.swapFail()
 }
 
-func (s *Store) apply(a *archive, plan restorePlan) error {
+func (s *Store) apply(a *archive, plan restorePlan, journalDir string) error {
 	prev := s.swapFail
 	s.swapFail = nil
 	defer func() { s.swapFail = prev }()
@@ -408,18 +431,21 @@ func (s *Store) apply(a *archive, plan restorePlan) error {
 		}
 		return err
 	}
-	if err := s.commit(staged); err != nil {
+	if err := s.commit(staged, journalDir); err != nil {
+		if journalIsCommitted(journalDir) {
+			return err
+		}
 		undoErr := staged.undo()
 		if discardErr := staged.discard(); discardErr != nil {
 			undoErr = errors.Join(undoErr, discardErr)
 		}
-		if undoErr != nil {
-			return errors.Join(err, undoErr)
+		if undoErr == nil {
+			if rmErr := removeJournal(journalDir); rmErr != nil {
+				return errors.Join(err, rmErr)
+			}
+			return err
 		}
-		return err
-	}
-	if err := staged.removeHolds(); err != nil {
-		return err
+		return errors.Join(err, undoErr)
 	}
 	return nil
 }
@@ -448,30 +474,6 @@ func (st *stagedSet) discard() error {
 	return err
 }
 
-func (st *stagedSet) removeHolds() error {
-	if st == nil {
-		return nil
-	}
-	var err error
-	for i := range st.dirs {
-		err = errors.Join(err, removeHold(st.dirs[i].hold))
-	}
-	for i := range st.files {
-		err = errors.Join(err, removeHold(st.files[i].hold))
-	}
-	return err
-}
-
-func removeHold(hold string) error {
-	if hold == "" {
-		return nil
-	}
-	if err := os.RemoveAll(hold); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return nil
-}
-
 func (st *stagedSet) undo() error {
 	if st == nil {
 		return nil
@@ -491,23 +493,34 @@ func (st *stagedSet) undo() error {
 }
 
 func undoSwapped(dest, hold string, swapped bool) error {
-	if !swapped {
-		return nil
-	}
-	if hold == "" {
-		if err := os.RemoveAll(dest); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if hold != "" {
+		_, err := os.Lstat(hold)
+		if err == nil {
+			return putBack(dest, hold)
+		}
+		if !errors.Is(err, os.ErrNotExist) {
 			return err
+		}
+		if swapped {
+			return fmt.Errorf("previous copy of %s is missing", dest)
 		}
 		return nil
 	}
-	if _, err := os.Stat(hold); err != nil {
-		return fmt.Errorf("previous copy of %s is missing: %w", dest, err)
+	if !swapped {
+		return nil
 	}
+	if err := os.RemoveAll(dest); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func putBack(dest, hold string) error {
 	junk := dest + undoSuffix
 	if err := os.RemoveAll(junk); err != nil {
 		return err
 	}
-	if _, err := os.Stat(dest); err == nil {
+	if _, err := os.Lstat(dest); err == nil {
 		if err := renameRetry(dest, junk); err != nil {
 			return err
 		}
@@ -523,7 +536,7 @@ func undoSwapped(dest, hold string, swapped bool) error {
 	return syncDir(filepath.Dir(dest))
 }
 
-func swapPath(dest, src string, dir bool) (string, error) {
+func swapPath(dest, src, hold string, dir bool) (string, error) {
 	info, err := os.Lstat(dest)
 	if errors.Is(err, os.ErrNotExist) {
 		if mkErr := os.MkdirAll(filepath.Dir(dest), 0o755); mkErr != nil {
@@ -546,9 +559,11 @@ func swapPath(dest, src string, dir bool) (string, error) {
 	if !dir && info.IsDir() {
 		return "", fmt.Errorf("config path %s is a directory", dest)
 	}
-	hold, err := allocateHold(dest)
-	if err != nil {
-		return "", err
+	if hold == "" {
+		hold, err = allocateHold(dest)
+		if err != nil {
+			return "", err
+		}
 	}
 	if err := renameRetry(dest, hold); err != nil {
 		return "", err

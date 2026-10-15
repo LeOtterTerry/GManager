@@ -208,6 +208,8 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/v1/servers/{instanceId}/backup", s.postBackup)
 	mux.HandleFunc("GET /api/v1/servers/{instanceId}/backups", s.getBackups)
 	mux.HandleFunc("POST /api/v1/servers/{instanceId}/backups/discard", s.postDiscardBackup)
+	mux.HandleFunc("POST /api/v1/servers/{instanceId}/backups/sign", s.postSignBackup)
+	mux.HandleFunc("POST /api/v1/servers/{instanceId}/backups/release", s.postReleaseBackup)
 	mux.HandleFunc("POST /api/v1/servers/{instanceId}/restore", s.postRestore)
 	mux.HandleFunc("GET /api/v1/servers/{instanceId}/config", s.getConfig)
 	mux.HandleFunc("PUT /api/v1/servers/{instanceId}/config", s.putConfig)

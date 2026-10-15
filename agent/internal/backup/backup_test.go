@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -449,7 +450,7 @@ func TestFailedSwapRollsBackFromSafety(t *testing.T) {
 		}
 		return errors.New("injected swap failure")
 	}
-	err = store.RestoreInto(ctx, old.ID, inst, mod, safety.ID)
+	err = store.RestoreInto(ctx, old.ID, inst, mod, safety.ID, nil)
 	if err == nil || !strings.Contains(err.Error(), "rolled back from safety backup") {
 		t.Fatalf("err = %v", err)
 	}
@@ -498,7 +499,7 @@ func TestFailedSwapUndoesBeforeSafetyZip(t *testing.T) {
 		}
 		return errors.New("injected swap failure")
 	}
-	err = store.RestoreInto(ctx, old.ID, inst, mod, safety.ID)
+	err = store.RestoreInto(ctx, old.ID, inst, mod, safety.ID, nil)
 	if err == nil || strings.Contains(err.Error(), "rolled back") {
 		t.Fatalf("err = %v", err)
 	}
@@ -557,8 +558,11 @@ func TestCorruptZipAndPartialDoNotBreakList(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(partial); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("partial file was kept")
+	if _, err := os.Stat(partial); err != nil {
+		t.Fatal("list removed the partial")
+	}
+	if _, err := os.Stat(filepath.Join(store.Dir, badID+".zip")); err != nil {
+		t.Fatal("list quarantined or removed the bad zip")
 	}
 	var sawGood, sawBad bool
 	for _, item := range page {
@@ -609,7 +613,7 @@ func TestMissingKeyDoesNotMintOrDelete(t *testing.T) {
 	if _, err := store.Create(ctx, Request{Instance: inst, Module: mod, Kind: KindManual}); err != nil {
 		t.Fatal(err)
 	}
-	copies := []string{keyPath, keyPath + ".bak", filepath.Join(dir, "integrity.key")}
+	copies := []string{keyPath, keyPath + ".bak", filepath.Join(filepath.Dir(keyPath), "integrity.key")}
 	for _, path := range copies {
 		info, err := os.Stat(path)
 		if err != nil {
@@ -618,6 +622,9 @@ func TestMissingKeyDoesNotMintOrDelete(t *testing.T) {
 		if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
 			t.Fatalf("%s mode = %o", path, info.Mode().Perm())
 		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "integrity.key")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("integrity key was written into the backup directory")
 	}
 	if err := os.Remove(keyPath); err != nil {
 		t.Fatal(err)
@@ -664,13 +671,54 @@ func TestUnsignedBackupIsSignedInPlace(t *testing.T) {
 	}
 	path := filepath.Join(store.Dir, entry.ID+".zip")
 	clearHMAC(t, path, false)
-	if err := store.Verify(entry.ID); err != nil {
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, _, err := store.List("", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 1 || !page[0].Unsigned || page[0].Corrupt {
+		t.Fatalf("page = %+v", page)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("list rewrote the unsigned zip")
+	}
+	later, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !later.ModTime().Equal(info.ModTime()) || later.Size() != info.Size() {
+		t.Fatal("list changed the unsigned zip")
+	}
+	if err := store.Verify(entry.ID); !errors.Is(err, ErrUnsigned) {
+		t.Fatalf("verify = %v", err)
+	}
+	writeSave(t, save, "world.dat", "live")
+	if err := store.Restore(ctx, entry.ID, inst, mod); !errors.Is(err, ErrUnsigned) {
+		t.Fatalf("restore = %v", err)
+	}
+	if got := readSave(t, save, "world.dat"); got != "live" {
+		t.Fatalf("world = %q", got)
+	}
+	if err := store.Sign(entry.ID); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Contains(manifestJSON(t, path), []byte(`"hmac"`)) {
-		t.Fatal("unsigned archive was not signed")
+		t.Fatal("sign left the archive unsigned")
 	}
-	writeSave(t, save, "world.dat", "live")
+	if err := store.Verify(entry.ID); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.Restore(ctx, entry.ID, inst, mod); err != nil {
 		t.Fatal(err)
 	}
@@ -686,6 +734,9 @@ func TestUnsignedBackupIsSignedInPlace(t *testing.T) {
 	clearHMAC(t, path, true)
 	if err := os.Chtimes(path, time.Now().Add(2*time.Second), time.Now().Add(2*time.Second)); err != nil {
 		t.Fatal(err)
+	}
+	if err := store.Sign(entry.ID); !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("sign bad hash = %v", err)
 	}
 	if err := store.Verify(entry.ID); !errors.Is(err, ErrIntegrity) {
 		t.Fatalf("bad hash = %v", err)
@@ -761,71 +812,111 @@ func TestInventoryCacheSkipsUnchangedZips(t *testing.T) {
 	}
 }
 
-func TestRecoverRestoresHoldAndDropsStaging(t *testing.T) {
+func TestJournalRollsBackPendingAndReportsUnjournaledHolds(t *testing.T) {
 	root := t.TempDir()
 	dest := filepath.Join(root, "saves")
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dest, "world.dat"), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	hold := filepath.Join(root, ".gmanager-hold-saves")
 	if err := os.MkdirAll(hold, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(hold, "world.dat"), []byte("held"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(hold, "world.dat"), []byte("old"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	staging := filepath.Join(root, ".gmanager-restore-abc")
 	if err := os.MkdirAll(staging, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	stray := filepath.Join(root, ".gmanager-migrate-abc")
+	if err := os.MkdirAll(stray, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pending := journalFile{
+		Version: journalVersion,
+		State:   journalPending,
+		Targets: []journalTarget{{Dest: dest, Hold: hold, Dir: true}},
+		Staging: []string{staging},
+	}
+	if err := writeJournal(root, pending); err != nil {
+		t.Fatal(err)
+	}
 	if err := Recover(dest); err != nil {
 		t.Fatal(err)
 	}
-	if got := readSave(t, dest, "world.dat"); got != "held" {
+	if got := readSave(t, dest, "world.dat"); got != "new" {
+		t.Fatalf("child scan changed the save: %q", got)
+	}
+	if _, err := os.Stat(hold); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(journalPath(root)); err != nil {
+		t.Fatal(err)
+	}
+	if err := Recover(root); err != nil {
+		t.Fatal(err)
+	}
+	if got := readSave(t, dest, "world.dat"); got != "old" {
 		t.Fatalf("world = %q", got)
 	}
+	if _, err := os.Stat(hold); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("pending hold was kept")
+	}
 	if _, err := os.Stat(staging); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("staging directory was kept")
+		t.Fatal("journaled staging was kept")
+	}
+	if _, err := os.Stat(stray); err != nil {
+		t.Fatal("unlisted staging was removed")
+	}
+	if _, err := os.Stat(journalPath(root)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("journal was kept")
+	}
+
+	if err := os.WriteFile(filepath.Join(dest, "world.dat"), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 	extra := filepath.Join(root, ".gmanager-hold-saves.2")
 	if err := os.MkdirAll(extra, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := Recover(dest); err != nil {
+	if err := os.WriteFile(filepath.Join(extra, "world.dat"), []byte("held"), 0o644); err != nil {
 		t.Fatal(err)
+	}
+	committed := journalFile{
+		Version: journalVersion,
+		State:   journalCommitted,
+		Targets: []journalTarget{{Dest: dest, Hold: extra, Dir: true}},
+	}
+	if err := writeJournal(root, committed); err != nil {
+		t.Fatal(err)
+	}
+	if err := Recover(root); err != nil {
+		t.Fatal(err)
+	}
+	if got := readSave(t, dest, "world.dat"); got != "new" {
+		t.Fatalf("committed world = %q", got)
 	}
 	if _, err := os.Stat(extra); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("committed hold was kept")
 	}
 
-	cfgDir := t.TempDir()
-	cfg := filepath.Join(cfgDir, "server.json")
-	cfgHold := filepath.Join(cfgDir, ".gmanager-hold-server.json")
-	if err := os.WriteFile(cfgHold, []byte("old-config"), 0o644); err != nil {
+	orphan := filepath.Join(root, ".gmanager-hold-saves")
+	if err := os.MkdirAll(orphan, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := Recover(cfg); err != nil {
+	if err := os.WriteFile(filepath.Join(orphan, "world.dat"), []byte("only-copy"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	b, err := os.ReadFile(cfg)
-	if err != nil {
-		t.Fatal(err)
+	err := Recover(root)
+	if !errors.Is(err, ErrUnjournaledHold) {
+		t.Fatalf("unjournaled = %v", err)
 	}
-	if string(b) != "old-config" {
-		t.Fatalf("config = %q", b)
-	}
-
-	undoDir := t.TempDir()
-	undoDest := filepath.Join(undoDir, "saves")
-	junk := undoDest + ".gmanager-undo"
-	if err := os.MkdirAll(junk, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(junk, "world.dat"), []byte("undo"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := Recover(undoDest); err != nil {
-		t.Fatal(err)
-	}
-	if got := readSave(t, undoDest, "world.dat"); got != "undo" {
-		t.Fatalf("undo world = %q", got)
+	if _, err := os.Stat(orphan); err != nil {
+		t.Fatal("unjournaled hold was deleted")
 	}
 }
 
@@ -873,15 +964,169 @@ func TestAdaptConfigRefusesBeforeSwap(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeSave(t, save, "world.dat", "live")
-	store.AdaptConfig = func(string, []byte) ([]byte, error) {
+	err = store.RestoreInto(context.Background(), entry.ID, inst, mod, "", func(string, []byte) ([]byte, error) {
 		return nil, errors.New("refusing to restore")
-	}
-	err = store.Restore(context.Background(), entry.ID, inst, mod)
+	})
 	if err == nil || !strings.Contains(err.Error(), "refusing to restore") {
 		t.Fatalf("err = %v", err)
 	}
 	if got := readSave(t, save, "world.dat"); got != "live" {
 		t.Fatalf("world = %q", got)
+	}
+}
+
+func TestPendingJournalIsWrittenBeforeSwap(t *testing.T) {
+	inst, mod, save := newWorld(t)
+	writeSave(t, save, "world.dat", "alpha")
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), Keep: 5, Key: testKey()}
+	entry, err := store.Create(context.Background(), Request{Instance: inst, Module: mod, Kind: KindManual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSave(t, save, "world.dat", "live")
+	store.swapFail = func() error {
+		j, err := readJournal(inst.Dir)
+		if err != nil {
+			return err
+		}
+		if j.State != journalPending || len(j.Targets) == 0 {
+			return errors.New("journal was not pending before the swap")
+		}
+		return errors.New("stop before swap")
+	}
+	err = store.Restore(context.Background(), entry.ID, inst, mod)
+	if err == nil || !strings.Contains(err.Error(), "stop before swap") {
+		t.Fatalf("err = %v", err)
+	}
+	if got := readSave(t, save, "world.dat"); got != "live" {
+		t.Fatalf("world = %q", got)
+	}
+	if _, err := os.Stat(journalPath(inst.Dir)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("journal left behind: %v", err)
+	}
+}
+
+func TestClassifyRetriesOpenOnce(t *testing.T) {
+	inst, mod, save := newWorld(t)
+	writeSave(t, save, "world.dat", "v")
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), Keep: 5, Key: testKey()}
+	calls := 0
+	classifyOpenHook = func() error {
+		calls++
+		if calls == 1 {
+			return errors.New("transient")
+		}
+		return nil
+	}
+	t.Cleanup(func() { classifyOpenHook = nil })
+	entry, err := store.Create(context.Background(), Request{Instance: inst, Module: mod, Kind: KindManual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("opens = %d", calls)
+	}
+	if _, err := os.Stat(filepath.Join(store.Dir, entry.ID+".zip")); err != nil {
+		t.Fatal(err)
+	}
+	page, _, err := store.List("", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 1 || page[0].Corrupt || page[0].Quarantined {
+		t.Fatalf("page = %+v", page)
+	}
+}
+
+func TestPruneAndDiscardShareTheMutex(t *testing.T) {
+	inst, mod, save := newWorld(t)
+	writeSave(t, save, "world.dat", "v")
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), Keep: 5, Key: testKey()}
+	if _, err := store.Create(context.Background(), Request{Instance: inst, Module: mod, Kind: KindManual}); err != nil {
+		t.Fatal(err)
+	}
+	badID := "20261015T010101.000000000Z"
+	if err := os.WriteFile(filepath.Join(store.Dir, badID+".zip"), []byte("not a zip"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	otherID := "20261015T010102.000000000Z"
+	quarantine := filepath.Join(store.Dir, otherID+".zip.quarantine")
+	if err := os.WriteFile(quarantine, []byte("aside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	store.hookQuarantine = func() {
+		once.Do(func() { close(started) })
+		<-release
+	}
+	pruneErr := make(chan error, 1)
+	go func() {
+		pruneErr <- store.prune(nil)
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("quarantine did not start")
+	}
+	discardErr := make(chan error, 1)
+	go func() {
+		discardErr <- store.Discard(otherID)
+	}()
+	select {
+	case err := <-discardErr:
+		t.Fatalf("discard finished while quarantine held the mutex: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(release)
+	if err := <-pruneErr; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-discardErr; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(quarantine); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("discard left the quarantine file")
+	}
+	if _, err := os.Stat(filepath.Join(store.Dir, badID+".zip.quarantine")); err != nil {
+		t.Fatalf("bad zip was not quarantined: %v", err)
+	}
+}
+
+func TestReleaseRestoresOneQuarantineFile(t *testing.T) {
+	inst, mod, save := newWorld(t)
+	writeSave(t, save, "world.dat", "v")
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), Keep: 5, Key: testKey()}
+	entry, err := store.Create(context.Background(), Request{Instance: inst, Module: mod, Kind: KindManual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := filepath.Join(store.Dir, entry.ID+".zip")
+	aside := live + ".quarantine"
+	if err := os.Rename(live, aside); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Release(entry.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(live); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(aside); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("quarantine file was kept")
+	}
+	if err := os.WriteFile(aside, []byte("extra"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Release(entry.ID); !errors.Is(err, ErrLiveBackup) {
+		t.Fatalf("live = %v", err)
+	}
+	if _, err := os.Stat(live); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(aside); err != nil {
+		t.Fatal(err)
 	}
 }
 

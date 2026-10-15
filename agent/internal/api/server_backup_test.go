@@ -475,6 +475,41 @@ func TestDiscardRemovesOnlyQuarantine(t *testing.T) {
 	}
 }
 
+func TestSignAndRelease(t *testing.T) {
+	save := t.TempDir()
+	archives := testArchives(t, 10)
+	_, httpSrv, cfgPath := newAPIOpt(t, 100, Options{Archives: archives})
+	writeCfg(t, cfgPath, configJSON(t, save, "kept"))
+	writeSaveFile(t, save, "world.dat", "alpha")
+	status, body, _ := do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backup", "test-token", `{}`, nil)
+	if status != http.StatusAccepted {
+		t.Fatalf("backup = %d %s", status, body)
+	}
+	id, _ := succeededResult(t, httpSrv.URL, body)["id"].(string)
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/sign", "test-token", `{"id":"`+id+`"}`, nil)
+	if status != http.StatusBadRequest || !bytes.Contains(body, []byte("confirm_required")) {
+		t.Fatalf("sign confirm = %d %s", status, body)
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/sign", "test-token", `{"confirm":true,"id":"`+id+`"}`, nil)
+	if status != http.StatusOK || !bytes.Contains(body, []byte(`"action":"sign"`)) {
+		t.Fatalf("sign = %d %s", status, body)
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/release", "test-token", `{"confirm":true,"id":"`+id+`"}`, nil)
+	if status != http.StatusConflict || !bytes.Contains(body, []byte("not_quarantined")) {
+		t.Fatalf("release live = %d %s", status, body)
+	}
+	if err := os.Rename(filepath.Join(archives.Dir, id+".zip"), filepath.Join(archives.Dir, id+".zip.quarantine")); err != nil {
+		t.Fatal(err)
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/release", "test-token", `{"confirm":true,"id":"`+id+`"}`, nil)
+	if status != http.StatusOK || !bytes.Contains(body, []byte(`"action":"release"`)) {
+		t.Fatalf("release = %d %s", status, body)
+	}
+	if _, err := os.Stat(filepath.Join(archives.Dir, id+".zip")); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestUserDirOverrideWinsOverConfig(t *testing.T) {
 	flagDir := t.TempDir()
 	configDir := t.TempDir()
