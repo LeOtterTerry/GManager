@@ -10,7 +10,7 @@ This slice implements the contract below. Process control, SteamCMD, backups, an
 
 ## Rate limit
 
-Default: **120 requests per minute** per client IP (`DefaultRateLimit`, `DefaultRateWindow`). Authentication runs first. A **401** does not consume the limit. Authenticated requests count, including a later **403**.
+Default: **120 requests per minute** per client IP (`DefaultRateLimit`, `DefaultRateWindow`). Authentication is checked first, and a failed check counts toward the same limit so token guessing is throttled. Once the limit is reached the response is **429**, including further wrong tokens. Authenticated requests count too, including a later **403**.
 
 When the limit is exceeded the response is **429** with `Retry-After` set to a whole number of seconds.
 
@@ -30,7 +30,7 @@ Writes return **202**:
 
 `GET /api/v1/jobs/{id}` → **200** with `id`, `type`, `instanceId`, `state`, `error`, `result`, `createdAt`, `finishedAt`.
 
-`state` is `queued`, `running`, `succeeded`, or `failed`. Unknown ids are **404**.
+`state` is `queued`, `running`, `succeeded`, or `failed`. Unknown ids are **404**. Finished jobs are kept in memory for 15 minutes (`DefaultRetention`) and then dropped, which also returns **404**.
 
 In this slice, config saves are decided before the response (so a conflict is a synchronous **409**, not a failed job). An accepted config save is recorded as a job that is already `succeeded`. Other accepted actions are real jobs. `start` builds the module launch plan and does **not** spawn a process, and it does **not** rewrite config. `stop`, `restart`, `install`, `update`, `backup`, and `restore` record `implemented: false`.
 
@@ -41,7 +41,7 @@ Any write accepts `Idempotency-Key` (max 200 characters).
 - The same key and the same request (method, path, query, `If-Match`, body) replay the original **202** body and `Location`.
 - The same key with a different request is **409** `idempotency_conflict`.
 - Keys are stored only for accepted **202** responses. A **400** or **409** can be retried with the same key.
-- The store is in memory and is empty after a restart.
+- The store is in memory, entries expire after 15 minutes (`DefaultRetention`), and it is empty after a restart.
 
 ## Destructive actions
 

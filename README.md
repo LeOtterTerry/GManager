@@ -41,7 +41,7 @@ export GMANAGER_TOKEN=dev-placeholder-token-0123456789
 go run ./cmd/gmanager --addr 127.0.0.1:8787
 ```
 
-`GMANAGER_TOKEN` must be at least 32 characters. If it is unset, the agent writes an owner-only token file at `<data-dir>/token` and does not print the token. A shorter environment value or token file is refused. Do not commit a real token. `--addr` must be `127.0.0.1`; `0.0.0.0` and other hosts are refused.
+`GMANAGER_TOKEN` must be at least 32 characters. If it is unset, the agent writes an owner-only token file at `<data-dir>/token` and does not print the token. A shorter environment value or token file is refused. An existing token file that other users can read is tightened, and the agent refuses to start when that cannot be done. Do not commit a real token. `--addr` must be `127.0.0.1`; `0.0.0.0` and other hosts are refused. Wrong tokens count toward the per-IP rate limit.
 
 Defaults:
 
@@ -72,7 +72,7 @@ cd agent && go test ./...
 cd web && npm run build
 ```
 
-Config validation and the external-edit safeguard are covered in `agent/modules/plainsofpain` and `agent/internal/config`. The API tests cover 202 jobs, idempotency, `If-Match` 409, cursor logs, confirm, and 429.
+Config validation and the external-edit safeguard are covered in `agent/modules/plainsofpain` and `agent/internal/config`. The API tests cover 202 jobs, idempotency, `If-Match` 409, cursor logs, confirm, and 429. CI also runs `go test ./...` on `windows-latest`, which builds and runs the Windows-only files.
 
 ## Unknowns (do not guess)
 

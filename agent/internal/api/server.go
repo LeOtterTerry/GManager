@@ -177,20 +177,13 @@ func (s *Server) routes() http.Handler {
 func (s *Server) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !authorized(r, s.tokenSum) {
+			if !s.allow(w, r) {
+				return
+			}
 			writeJSON(w, http.StatusUnauthorized, errorBody{Error: "unauthorized", Message: "bearer token required"})
 			return
 		}
-		ok, retry := s.limiter.Allow(clientIP(r))
-		if !ok {
-			sec := int((retry + time.Second - 1) / time.Second)
-			if sec < 1 {
-				sec = 1
-			}
-			w.Header().Set("Retry-After", strconv.Itoa(sec))
-			writeJSON(w, http.StatusTooManyRequests, errorBody{
-				Error:   "rate_limited",
-				Message: "too many requests",
-			})
+		if !s.allow(w, r) {
 			return
 		}
 		if err := checkRequest(r, s.uiPort); err != nil {
@@ -203,6 +196,23 @@ func (s *Server) wrap(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (s *Server) allow(w http.ResponseWriter, r *http.Request) bool {
+	ok, retry := s.limiter.Allow(clientIP(r))
+	if ok {
+		return true
+	}
+	sec := int((retry + time.Second - 1) / time.Second)
+	if sec < 1 {
+		sec = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(sec))
+	writeJSON(w, http.StatusTooManyRequests, errorBody{
+		Error:   "rate_limited",
+		Message: "too many requests",
+	})
+	return false
 }
 
 func clientIP(r *http.Request) string {

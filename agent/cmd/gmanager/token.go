@@ -15,9 +15,13 @@ import (
 // MinTokenLength is the shortest accepted bearer token.
 const MinTokenLength = 32
 
+// restrictTokenFile applies owner-only permissions. Tests replace it.
+var restrictTokenFile = restrictToOwner
+
 // ResolveToken returns GMANAGER_TOKEN when it is long enough.
 // Otherwise it reads <dataDir>/token, or creates that file from crypto/rand
-// with owner-only permissions. The token itself is never logged.
+// with owner-only permissions. An existing file that other users can read is
+// tightened; startup fails when that cannot be done. The token itself is never logged.
 func ResolveToken(dataDir string) (string, error) {
 	if env := os.Getenv("GMANAGER_TOKEN"); env != "" {
 		if len(env) < MinTokenLength {
@@ -31,6 +35,9 @@ func ResolveToken(dataDir string) (string, error) {
 		token := strings.TrimSpace(string(b))
 		if len(token) < MinTokenLength {
 			return "", fmt.Errorf("token file %s is shorter than %d characters", path, MinTokenLength)
+		}
+		if err := ensureOwnerOnly(path); err != nil {
+			return "", err
 		}
 		return token, nil
 	}
@@ -72,7 +79,29 @@ func writeTokenFile(path, token string) error {
 	if err := os.Chmod(path, 0o600); err != nil {
 		return err
 	}
-	return restrictToOwner(path)
+	return restrictTokenFile(path)
+}
+
+func ensureOwnerOnly(path string) error {
+	open, err := tokenOpenToOthers(path)
+	if err != nil {
+		return err
+	}
+	if !open {
+		return nil
+	}
+	if err := restrictTokenFile(path); err != nil {
+		return fmt.Errorf("token file %s is readable by other users and could not be restricted: %w", path, err)
+	}
+	open, err = tokenOpenToOthers(path)
+	if err != nil {
+		return err
+	}
+	if open {
+		return fmt.Errorf("refusing to start: token file %s is still readable by other users", path)
+	}
+	log.Printf("restricted token file %s to the owner", path)
+	return nil
 }
 
 func defaultDataDir() string {

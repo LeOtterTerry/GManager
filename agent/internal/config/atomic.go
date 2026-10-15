@@ -15,8 +15,9 @@ import (
 const maxBackups = 20
 
 // renameFile replaces newpath with oldpath in one operation.
-// On Windows, os.Rename uses MoveFileEx with MOVEFILE_REPLACE_EXISTING, so
-// the replacement does not move the live file aside first.
+// On Windows, moveFileReplace uses MoveFileEx with MOVEFILE_REPLACE_EXISTING
+// and MOVEFILE_WRITE_THROUGH, so the replacement does not move the live file
+// aside first and the directory fsync below is not required for durability.
 var renameFile = os.Rename
 
 // atomicWrite replaces path with data.

@@ -102,21 +102,45 @@ func TestAuthHostOriginAndRateLimit(t *testing.T) {
 	if status != http.StatusUnauthorized {
 		t.Fatalf("missing token = %d", status)
 	}
-	status, body, _ := do(t, httpSrv.URL, http.MethodGet, "/api/v1/health", "test-token", "", nil)
-	if status != http.StatusOK || !bytes.Contains(body, []byte(`"bindHost":"127.0.0.1"`)) {
-		t.Fatalf("health = %d %s", status, body)
+	status, _, _ = do(t, httpSrv.URL, http.MethodGet, "/api/v1/health", "wrong-token", "", nil)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("wrong token = %d", status)
 	}
-	status, body, _ = do(t, httpSrv.URL, http.MethodGet, "/api/v1/health", "test-token", "", nil)
-	if status != http.StatusOK {
-		t.Fatalf("second authenticated request = %d %s", status, body)
-	}
-	status, body, hdr := do(t, httpSrv.URL, http.MethodGet, "/api/v1/health", "test-token", "", nil)
+	status, body, hdr := do(t, httpSrv.URL, http.MethodGet, "/api/v1/health", "another-wrong-token", "", nil)
 	if status != http.StatusTooManyRequests {
-		t.Fatalf("third authenticated request = %d %s", status, body)
+		t.Fatalf("token guess = %d %s", status, body)
 	}
 	retryAfter, err := strconv.Atoi(hdr.Get("Retry-After"))
 	if err != nil || retryAfter < 1 {
 		t.Fatalf("Retry-After = %q", hdr.Get("Retry-After"))
+	}
+
+	_, authed, _ := newAPI(t, 2)
+	status, body, _ = do(t, authed.URL, http.MethodGet, "/api/v1/health", "test-token", "", nil)
+	if status != http.StatusOK || !bytes.Contains(body, []byte(`"bindHost":"127.0.0.1"`)) {
+		t.Fatalf("health = %d %s", status, body)
+	}
+	status, body, _ = do(t, authed.URL, http.MethodGet, "/api/v1/health", "test-token", "", nil)
+	if status != http.StatusOK {
+		t.Fatalf("second authenticated request = %d %s", status, body)
+	}
+	status, body, _ = do(t, authed.URL, http.MethodGet, "/api/v1/health", "test-token", "", nil)
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("third authenticated request = %d %s", status, body)
+	}
+
+	_, mixed, _ := newAPI(t, 2)
+	status, _, _ = do(t, mixed.URL, http.MethodGet, "/api/v1/health", "", "", nil)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("mixed missing token = %d", status)
+	}
+	status, _, _ = do(t, mixed.URL, http.MethodGet, "/api/v1/health", "test-token", "", nil)
+	if status != http.StatusOK {
+		t.Fatalf("mixed authenticated = %d", status)
+	}
+	status, _, _ = do(t, mixed.URL, http.MethodGet, "/api/v1/health", "test-token", "", nil)
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("failure should share the limit, got %d", status)
 	}
 
 	_, open, _ := newAPI(t, 20)

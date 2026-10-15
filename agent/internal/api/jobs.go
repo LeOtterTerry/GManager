@@ -9,6 +9,10 @@ import (
 	"time"
 )
 
+// DefaultRetention is how long a finished job or an idempotency record stays
+// in memory. Running jobs are kept until they finish.
+const DefaultRetention = 15 * time.Minute
+
 // JobState is the lifecycle of an accepted write.
 type JobState string
 
@@ -39,16 +43,24 @@ type Job struct {
 type JobFunc func() (any, error)
 
 // JobRunner stores jobs in memory. Persistence is a later slice.
+// Finished jobs older than DefaultRetention are dropped.
 type JobRunner struct {
 	mu     sync.Mutex
 	jobs   map[string]*Job
 	inline bool
+	ttl    time.Duration
+	now    func() time.Time
 }
 
 // NewJobRunner returns an in-memory runner.
 // Inline runs the job before Start returns, which tests use for determinism.
 func NewJobRunner(inline bool) *JobRunner {
-	return &JobRunner{jobs: map[string]*Job{}, inline: inline}
+	return &JobRunner{
+		jobs:   map[string]*Job{},
+		inline: inline,
+		ttl:    DefaultRetention,
+		now:    time.Now,
+	}
 }
 
 // Start accepts work and returns the job immediately when not inline.
@@ -67,10 +79,11 @@ func (r *JobRunner) Record(typ, instanceID string, result any, err error) *Job {
 	return r.copy(job.ID)
 }
 
-// Get returns a copy of the job.
+// Get returns a copy of the job. Expired finished jobs are removed.
 func (r *JobRunner) Get(id string) (Job, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.sweepLocked()
 	job, ok := r.jobs[id]
 	if !ok {
 		return Job{}, false
@@ -84,9 +97,10 @@ func (r *JobRunner) new(typ, instanceID string) *Job {
 		Type:       typ,
 		InstanceID: instanceID,
 		State:      JobQueued,
-		CreatedAt:  time.Now().UTC(),
+		CreatedAt:  r.now().UTC(),
 	}
 	r.mu.Lock()
+	r.sweepLocked()
 	r.jobs[job.ID] = job
 	r.mu.Unlock()
 	return job
@@ -125,7 +139,7 @@ func (r *JobRunner) finish(job *Job, result any, err error) {
 	if job.State == JobSucceeded || job.State == JobFailed {
 		return
 	}
-	now := time.Now().UTC()
+	now := r.now().UTC()
 	job.FinishedAt = &now
 	if err != nil {
 		job.State = JobFailed
@@ -141,6 +155,18 @@ func (r *JobRunner) finish(job *Job, result any, err error) {
 			return
 		}
 		job.Result = raw
+	}
+}
+
+func (r *JobRunner) sweepLocked() {
+	if r.ttl <= 0 {
+		return
+	}
+	now := r.now()
+	for id, job := range r.jobs {
+		if job.FinishedAt != nil && now.Sub(*job.FinishedAt) > r.ttl {
+			delete(r.jobs, id)
+		}
 	}
 }
 
