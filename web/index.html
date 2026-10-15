@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GManager</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#content">Skip to main content</a>
+    <div class="chassis">
+      <header class="mast">
+        <p class="stamp">Local agent</p>
+        <div class="mast-copy">
+          <h1>GManager</h1>
+          <p>Plains of Pain dedicated server, on this PC.</p>
+        </div>
+      </header>
+      <div class="layout">
+        <nav aria-label="Sections">
+          <ul>
+            <li><button type="button" data-view="status" aria-current="page">Status</button></li>
+            <li><button type="button" data-view="config">Config</button></li>
+            <li><button type="button" data-view="logs">Logs</button></li>
+            <li><button type="button" data-view="jobs">Jobs</button></li>
+          </ul>
+        </nav>
+        <main id="content" tabindex="-1">
+          <section id="view-status" class="panel" aria-labelledby="status-heading">
+            <h2 id="status-heading" tabindex="-1">Status</h2>
+            <p>The agent listens on 127.0.0.1. This page does not start the game server.</p>
+            <form id="agent-check">
+              <div class="field">
+                <label for="agent-token">Agent token</label>
+                <p id="token-hint">Stays in this tab. It is not saved.</p>
+                <input id="agent-token" name="token" type="password" autocomplete="off" aria-describedby="token-hint" />
+              </div>
+              <button type="submit">Check agent</button>
+            </form>
+            <dl class="facts">
+              <div>
+                <dt>Reachable</dt>
+                <dd id="fact-reachable">Not checked</dd>
+              </div>
+              <div>
+                <dt>Bind host</dt>
+                <dd id="fact-bind">—</dd>
+              </div>
+            </dl>
+            <p id="agent-result" role="status"></p>
+          </section>
+          <section id="view-config" class="panel" hidden aria-labelledby="config-heading">
+            <h2 id="config-heading" tabindex="-1">Config</h2>
+            <p>
+              The editor keeps a revision of <span class="mono">server.json</span>. If the file changes outside
+              GManager, the next save shows the conflict and does not write over it. Unknown keys stay in the file.
+            </p>
+            <p>The form for those fields is not in this slice.</p>
+          </section>
+          <section id="view-logs" class="panel" hidden aria-labelledby="logs-heading">
+            <h2 id="logs-heading" tabindex="-1">Logs</h2>
+            <p>History is paged with <span class="mono">cursor</span> and <span class="mono">limit</span>. A live tail is not in this slice.</p>
+          </section>
+          <section id="view-jobs" class="panel" hidden aria-labelledby="jobs-heading">
+            <h2 id="jobs-heading" tabindex="-1">Jobs</h2>
+            <p>Start, stop, and config saves return 202 and a job id. Stop and restore require confirm. Poll the job to see whether it finished.</p>
+          </section>
+        </main>
+      </div>
+      <footer>
+        <p>Bound to this computer. Remote control is not part of GManager.</p>
+      </footer>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

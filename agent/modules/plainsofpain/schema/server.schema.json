@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gmanager.leotter.site/schemas/plains-of-pain/server.json",
+  "title": "Plains of Pain server.json",
+  "type": "object",
+  "additionalProperties": true,
+  "description": "Known keys are validated. Unknown keys must be preserved on save. Fields marked UNVERIFIED are not type-checked.",
+  "properties": {
+    "serverName": {
+      "type": "string"
+    },
+    "password": {
+      "type": "string",
+      "maxLength": 20,
+      "description": "At most 20 characters."
+    },
+    "maxPlayers": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 200
+    },
+    "worldId": {
+      "description": "UNVERIFIED type. TODO: confirm on first install. Preserved verbatim."
+    },
+    "mapId": {
+      "description": "UNVERIFIED type. TODO: confirm on first install. Preserved verbatim."
+    },
+    "seed": {
+      "description": "UNVERIFIED type. TODO: confirm on first install. Preserved verbatim."
+    },
+    "difficulty": {
+      "type": "integer",
+      "enum": [0, 1, 2, 3, 4, 255],
+      "description": "0–4, or 255 for custom. Custom values are set in-game; writing them from outside the client is unverified and out of scope."
+    },
+    "worldSize": {
+      "type": "integer",
+      "enum": [11, 21, 31, 41, 51]
+    },
+    "port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535,
+      "default": 7777,
+      "description": "UDP game port. Non-default values produce a warning because a custom-port bug has been reported."
+    },
+    "queryPort": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535,
+      "default": 27016,
+      "description": "UDP query port. Non-default values produce a warning."
+    },
+    "ttr": {
+      "description": "UNVERIFIED. TODO: how ttr interacts with scheduled restarts is not confirmed. Preserved verbatim."
+    },
+    "userdir": {
+      "type": "string",
+      "description": "Save directory override. Backups use this when it is set. The default save path is UNVERIFIED. TODO: confirm on first install."
+    },
+    "adminAccountIDs": {
+      "description": "UNVERIFIED format. TODO: confirm the value format on first install. Preserved verbatim. Do not commit a real Steam ID; fixtures use STEAM64_PLACEHOLDER."
+    }
+  }
+}
