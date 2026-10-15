@@ -36,7 +36,7 @@ func main() {
 	stopMethod := flag.String("stop-method", "", "stop override: empty uses the module; interrupt is SIGTERM on Unix and is not a confirmed Plains of Pain clean stop")
 	console := flag.Bool("console-commands", false, "pass -cc (UNVERIFIED on Windows; default false)")
 	steamTimeout := flag.Duration("steamcmd-timeout", steamcmd.DefaultRunTimeout, "maximum time for one SteamCMD install or update")
-	backupDir := flag.String("backup-dir", "", "backup directory (default P:\\GManager\\Backups when drive P: exists, otherwise <data-dir>/backups)")
+	backupDir := flag.String("backup-dir", "", "backup directory (default <data-dir>/backups). Must be absolute, not a UNC path, and not inside the server directory")
 	backupKeep := flag.Int("backup-keep", backup.DefaultKeep, "how many backups to keep; the oldest are deleted past this count")
 	userDir := flag.String("user-dir", "", "save directory override; empty reads userdir from server.json. The game's default save path is unverified")
 	flag.Parse()
@@ -78,6 +78,11 @@ func main() {
 	if dir == "" {
 		dir = filepath.Join(dirData, "servers", *instance)
 	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		stderr.Fatal(err)
+	}
+	dir = absDir
 	mod := plainsofpain.New()
 	mod.ManagerAPIPort = apiPort
 	mod.ManagerUIPort = *uiPort
@@ -97,7 +102,14 @@ func main() {
 	steam.Timeout = *steamTimeout
 	dirBackup := *backupDir
 	if dirBackup == "" {
-		dirBackup = backup.DefaultDir(dirData, nil)
+		dirBackup = backup.DefaultDir(dirData)
+	}
+	dirBackup, err = filepath.Abs(dirBackup)
+	if err != nil {
+		stderr.Fatal(err)
+	}
+	if err := backup.ValidateDir(dirBackup, dir); err != nil {
+		stderr.Fatal(err)
 	}
 	srv, err := api.New(api.Options{
 		Token:      token,
@@ -113,8 +125,12 @@ func main() {
 		Logs:       logs,
 		Supervisor: sup,
 		Steam:      steam,
-		Archives:   &backup.Store{Dir: dirBackup, Keep: *backupKeep},
-		UserDir:    *userDir,
+		Archives: &backup.Store{
+			Dir:     dirBackup,
+			Keep:    *backupKeep,
+			KeyPath: filepath.Join(dirData, "backup.hmac"),
+		},
+		UserDir: *userDir,
 	})
 	if err != nil {
 		stderr.Fatal(err)

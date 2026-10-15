@@ -4,6 +4,8 @@ package backup
 
 import "os"
 
-func replaceFile(oldpath, newpath string) error {
+func renameOnce(oldpath, newpath string) error {
 	return os.Rename(oldpath, newpath)
 }
+
+func retryableRename(error) bool { return false }

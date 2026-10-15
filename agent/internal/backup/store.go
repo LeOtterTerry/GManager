@@ -1,5 +1,6 @@
 // Package backup writes timestamped zip archives of a module's save
-// directories and config files. Each zip carries a sha256 manifest.
+// directories and config files. Each zip carries a sha256 manifest signed
+// with an HMAC key that stays outside the zip.
 // The caller must already have stopped the game process. This package does
 // not invent a save path: GameModule.SavePaths decides that, and an unknown
 // path fails the backup.
@@ -7,12 +8,15 @@ package backup
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/LeOtterTerry/GManager/agent/internal/core"
@@ -30,9 +34,9 @@ const (
 	// DefaultKeep is how many backups retention leaves when Keep is unset.
 	DefaultKeep = 10
 
-	// SuggestedDir is the backup folder offered when drive P: exists.
-	// Terry's PC has a P: SSD. The installer suggests this path; the agent
-	// uses it only when that drive is present and --backup-dir is empty.
+	// SuggestedDir is the folder an installer may offer when drive P: exists.
+	// The agent does not select it. The default is <data-dir>/backups unless
+	// --backup-dir is set.
 	SuggestedDir = `P:\GManager\Backups`
 )
 
@@ -63,6 +67,9 @@ type Entry struct {
 	FileCount  int       `json:"fileCount"`
 	Kind       string    `json:"kind"`
 	InstanceID string    `json:"instanceId"`
+	// Corrupt is true when the zip could not be read. One bad zip does not
+	// fail the list.
+	Corrupt bool `json:"corrupt,omitempty"`
 }
 
 // Request describes one backup. Protect ids are kept even when they are
@@ -83,6 +90,18 @@ type Store struct {
 	Now func() time.Time
 	// Free reports free bytes. Nil means disk.Free. Tests replace it.
 	Free func(string) (uint64, error)
+	// Key is the HMAC key. Tests set it. Production leaves it empty and
+	// uses KeyPath, which is never stored inside a zip.
+	Key []byte
+	// KeyPath is an owner-only file of at least 32 bytes outside the backup
+	// directory. It is created on first use when it is missing.
+	KeyPath string
+
+	keyMu     sync.Mutex
+	loadedKey []byte
+	// swapFail, when set, runs before each live swap during restore.
+	// Tests use it to force a partial swap. Production leaves it nil.
+	swapFail func() error
 }
 
 // SuggestDir returns SuggestedDir when volume P: exists.
@@ -104,11 +123,8 @@ func VolumeExists(path string) bool {
 	return err == nil && info.IsDir()
 }
 
-// DefaultDir is SuggestedDir when P: exists, otherwise <dataDir>/backups.
-func DefaultDir(dataDir string, exists func(string) bool) string {
-	if dir, ok := SuggestDir(exists); ok {
-		return dir
-	}
+// DefaultDir is <dataDir>/backups. SuggestDir is not applied here.
+func DefaultDir(dataDir string) string {
 	return filepath.Join(dataDir, "backups")
 }
 
@@ -122,11 +138,17 @@ func (s *Store) Create(ctx context.Context, req Request) (Entry, error) {
 	if s == nil || s.Dir == "" {
 		return Entry{}, errors.New("backup directory is not configured")
 	}
+	if err := ValidateDir(s.Dir, req.Instance.Dir); err != nil {
+		return Entry{}, err
+	}
 	if req.Module == nil {
 		return Entry{}, errors.New("module is required")
 	}
 	if !validKind(req.Kind) {
 		return Entry{}, errors.New("invalid backup kind")
+	}
+	if _, err := s.integrityKey(); err != nil {
+		return Entry{}, err
 	}
 	files, saves, total, err := s.collect(req)
 	if err != nil {
@@ -137,6 +159,9 @@ func (s *Store) Create(ctx context.Context, req Request) (Entry, error) {
 		return Entry{}, err
 	}
 	if err := os.MkdirAll(s.Dir, 0o755); err != nil {
+		return Entry{}, err
+	}
+	if err := s.sweepPartial(); err != nil {
 		return Entry{}, err
 	}
 	if err := s.ensureSpace(s.Dir, need); err != nil {
@@ -158,17 +183,24 @@ func (s *Store) Create(ctx context.Context, req Request) (Entry, error) {
 	}
 	partial := filepath.Join(s.Dir, id+".zip.partial")
 	final := filepath.Join(s.Dir, id+".zip")
-	written, err := writeZip(partial, man, files)
+	key, err := s.integrityKey()
+	if err != nil {
+		return Entry{}, err
+	}
+	written, err := writeZip(partial, man, files, key)
 	if err != nil {
 		if removeErr := os.Remove(partial); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 			return Entry{}, errors.Join(err, removeErr)
 		}
 		return Entry{}, err
 	}
-	if err := os.Rename(partial, final); err != nil {
+	if err := renameRetry(partial, final); err != nil {
 		if removeErr := os.Remove(partial); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 			return Entry{}, errors.Join(err, removeErr)
 		}
+		return Entry{}, err
+	}
+	if err := syncDir(s.Dir); err != nil {
 		return Entry{}, err
 	}
 	info, err := os.Stat(final)
@@ -254,7 +286,11 @@ func (s *Store) openVerified(id string) (*archive, error) {
 	} else if err != nil {
 		return nil, err
 	}
-	a, err := openArchive(path, true)
+	key, err := s.integrityKey()
+	if err != nil {
+		return nil, err
+	}
+	a, err := openArchive(path, openOpts{hash: true, mac: true, key: key})
 	if err != nil {
 		return nil, err
 	}
@@ -334,6 +370,9 @@ func (s *Store) collect(req Request) ([]sourceFile, []SaveRoot, uint64, error) {
 			if fi.Size() < 0 {
 				return fmt.Errorf("negative size for %s", zipName)
 			}
+			if uint64(fi.Size()) > maxZipFileBytes {
+				return fmt.Errorf("%s is too large to back up", zipName)
+			}
 			next, err := addSize(total, uint64(fi.Size()))
 			if err != nil {
 				return err
@@ -371,6 +410,9 @@ func (s *Store) collect(req Request) ([]sourceFile, []SaveRoot, uint64, error) {
 		if !info.Mode().IsRegular() {
 			return nil, nil, 0, fmt.Errorf("config file %s is not a regular file", rel)
 		}
+		if uint64(info.Size()) > maxZipFileBytes {
+			return nil, nil, 0, fmt.Errorf("%s is too large to back up", rel)
+		}
 		zipName, err := zipPathFor(roleConfig, rel, 0)
 		if err != nil {
 			return nil, nil, 0, err
@@ -394,6 +436,12 @@ func (s *Store) collect(req Request) ([]sourceFile, []SaveRoot, uint64, error) {
 		})
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].entry.Path < files[j].entry.Path })
+	if len(files)+1 > maxZipEntries {
+		return nil, nil, 0, errors.New("too many files to back up")
+	}
+	if total > maxZipBytes {
+		return nil, nil, 0, errors.New("backup is too large")
+	}
 	return files, roots, total, nil
 }
 
@@ -448,24 +496,58 @@ func (s *Store) allocateID(now time.Time) (string, error) {
 	return "", errors.New("could not allocate a backup id")
 }
 
+type zipMeta struct {
+	id       string
+	kind     string
+	verified bool
+}
+
 func (s *Store) prune(protect []string) error {
-	ids, err := s.ids()
+	inv, err := s.inventory()
 	if err != nil {
 		return err
 	}
-	keep := s.keepN()
-	if len(ids) <= keep {
-		return nil
+	keepN := s.keepN()
+	keep := map[string]struct{}{}
+	byKind := map[string][]zipMeta{}
+	for _, z := range inv {
+		byKind[z.kind] = append(byKind[z.kind], z)
 	}
-	protected := map[string]struct{}{}
-	for _, id := range protect {
-		protected[id] = struct{}{}
-	}
-	for _, id := range ids[:len(ids)-keep] {
-		if _, ok := protected[id]; ok {
+	for kind, group := range byKind {
+		if kind == "" {
 			continue
 		}
-		path, err := s.zipPath(id)
+		start := 0
+		if len(group) > keepN {
+			start = len(group) - keepN
+		}
+		for _, z := range group[start:] {
+			keep[z.id] = struct{}{}
+		}
+	}
+	for _, id := range protect {
+		keep[id] = struct{}{}
+	}
+	verifiedKept := false
+	for _, z := range inv {
+		if _, ok := keep[z.id]; ok && z.verified {
+			verifiedKept = true
+			break
+		}
+	}
+	if !verifiedKept {
+		for i := len(inv) - 1; i >= 0; i-- {
+			if inv[i].verified {
+				keep[inv[i].id] = struct{}{}
+				break
+			}
+		}
+	}
+	for _, z := range inv {
+		if _, ok := keep[z.id]; ok {
+			continue
+		}
+		path, err := s.zipPath(z.id)
 		if err != nil {
 			return err
 		}
@@ -474,6 +556,37 @@ func (s *Store) prune(protect []string) error {
 		}
 	}
 	return nil
+}
+
+func (s *Store) inventory() ([]zipMeta, error) {
+	ids, err := s.ids()
+	if err != nil {
+		return nil, err
+	}
+	key, err := s.integrityKey()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]zipMeta, 0, len(ids))
+	for _, id := range ids {
+		path, err := s.zipPath(id)
+		if err != nil {
+			return nil, err
+		}
+		meta := zipMeta{id: id}
+		a, err := openArchive(path, openOpts{hash: true, mac: true, key: key})
+		if err != nil {
+			out = append(out, meta)
+			continue
+		}
+		meta.kind = a.man.Kind
+		meta.verified = a.man.ID == id
+		if closeErr := a.Close(); closeErr != nil {
+			meta.verified = false
+		}
+		out = append(out, meta)
+	}
+	return out, nil
 }
 
 func (s *Store) ids() ([]string, error) {
@@ -504,7 +617,14 @@ func (s *Store) ids() ([]string, error) {
 }
 
 func (s *Store) entries() ([]Entry, error) {
+	if err := s.sweepPartial(); err != nil {
+		return nil, err
+	}
 	ids, err := s.ids()
+	if err != nil {
+		return nil, err
+	}
+	key, err := s.integrityKey()
 	if err != nil {
 		return nil, err
 	}
@@ -518,20 +638,112 @@ func (s *Store) entries() ([]Entry, error) {
 		if err != nil {
 			return nil, err
 		}
-		a, err := openArchive(path, false)
+		a, err := openArchive(path, openOpts{hash: false, mac: true, key: key})
 		if err != nil {
-			return nil, err
+			out = append(out, corruptEntry(id, info))
+			continue
 		}
 		man := a.man
-		if closeErr := a.Close(); closeErr != nil {
-			return nil, closeErr
-		}
-		if man.ID != id {
-			return nil, fmt.Errorf("%w: %s manifest id does not match the file name", ErrIntegrity, id)
+		closeErr := a.Close()
+		if closeErr != nil || man.ID != id {
+			out = append(out, corruptEntry(id, info))
+			continue
 		}
 		out = append(out, entryFrom(id, info, man))
 	}
 	return out, nil
+}
+
+func corruptEntry(id string, info os.FileInfo) Entry {
+	return Entry{
+		Cursor:  id,
+		ID:      id,
+		Bytes:   info.Size(),
+		Corrupt: true,
+	}
+}
+
+func (s *Store) sweepPartial() error {
+	entries, err := os.ReadDir(s.Dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".zip.partial") {
+			continue
+		}
+		if err := os.Remove(filepath.Join(s.Dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) integrityKey() ([]byte, error) {
+	if len(s.Key) >= 32 {
+		return s.Key, nil
+	}
+	s.keyMu.Lock()
+	defer s.keyMu.Unlock()
+	if len(s.loadedKey) >= 32 {
+		return append([]byte(nil), s.loadedKey...), nil
+	}
+	if s.KeyPath == "" {
+		return nil, errors.New("backup integrity key is not configured")
+	}
+	b, err := os.ReadFile(s.KeyPath)
+	if errors.Is(err, os.ErrNotExist) {
+		b = make([]byte, 32)
+		if _, err := rand.Read(b); err != nil {
+			return nil, err
+		}
+		if err := os.MkdirAll(filepath.Dir(s.KeyPath), 0o755); err != nil {
+			return nil, err
+		}
+		if err := writeKeyFile(s.KeyPath, b); err != nil {
+			if !errors.Is(err, os.ErrExist) {
+				return nil, err
+			}
+			b, err = os.ReadFile(s.KeyPath)
+			if err != nil {
+				return nil, err
+			}
+		}
+	} else if err != nil {
+		return nil, err
+	}
+	if len(b) < 32 {
+		return nil, errors.New("backup integrity key is too short")
+	}
+	s.loadedKey = append([]byte(nil), b...)
+	return b, nil
+}
+
+func writeKeyFile(path string, b []byte) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_, werr := f.Write(b)
+	serr := f.Sync()
+	cerr := f.Close()
+	if werr != nil {
+		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return errors.Join(werr, removeErr)
+		}
+		return werr
+	}
+	if serr != nil {
+		return serr
+	}
+	return cerr
 }
 
 func entryFrom(id string, info os.FileInfo, man Manifest) Entry {
@@ -584,6 +796,9 @@ func copyToFile(dest string, r io.Reader) (string, int64, error) {
 		return "", 0, err
 	}
 	sum, n, copyErr := hashReader(io.TeeReader(r, out))
+	if copyErr == nil {
+		copyErr = out.Sync()
+	}
 	if closeErr := out.Close(); copyErr == nil {
 		copyErr = closeErr
 	}

@@ -110,7 +110,9 @@ The agent does not write `server.json` when a start job runs.
 
 ## Backups
 
-The backup directory is `--backup-dir`. When that flag is empty and drive `P:` exists, the directory is `P:\GManager\Backups`. Otherwise it is `<data-dir>/backups`. `--backup-keep` (default **10**) deletes the oldest zips past that count. A backup that is about to be restored is not deleted to make room for its safety copy.
+The backup directory is `--backup-dir`. When that flag is empty the directory is `<data-dir>/backups`. It must be absolute, must not be a UNC path, and must not sit inside the server directory (or the other way around). The installer may still suggest `P:\GManager\Backups` when drive `P:` exists; the agent does not select that path on its own.
+
+`--backup-keep` (default **10**) is applied per kind (`manual`, `update`, `safety`). A manual backup is not deleted to make room for an update or a safety zip. Pruning always leaves at least one zip that still verifies, and it never deletes the zip that is about to be restored or the safety zip just written for that restore. Leftover `*.zip.partial` files are removed when a backup is written or listed.
 
 The save directory is `--user-dir` when that flag is set. Otherwise it is `userdir` from `server.json`. The Plains of Pain default save path is unverified, so a backup with neither value fails the job with `save path unknown` and writes nothing. The agent does not guess a path.
 
@@ -124,7 +126,7 @@ Each zip is named with a UTC timestamp id (`20060102T150405.000000000Z`, plus `-
 - `saves/<index>/<relative path>` for each save directory
 - `config/<relative path>` for each module config file (`configs/server.json` for Plains of Pain)
 
-Each file record has `path`, `sha256` (uncompressed bytes), `size`, `role`, and `rel`. The manifest does not contain file contents. A server password in `server.json` is inside the zip, because restore needs it, and is not copied into the list response or the manifest. The zip file is created with mode `0600`.
+Each file record has `path`, `sha256` (uncompressed bytes), `size`, `role`, and `rel`. The manifest also carries `hmac`, an HMAC-SHA256 over the canonical manifest. The key is an owner-only file at `<data-dir>/backup.hmac` and is not stored in the zip, so rewriting a hash to match a tampered file does not verify. The manifest does not contain file contents. A server password in `server.json` is inside the zip, because restore needs it, and is not copied into the list response or the manifest. The zip file is created with mode `0600`. Paths reject `:`, Windows reserved device names, and names with a trailing dot or space. The reader refuses archives that exceed the entry count, uncompressed size, or compression-ratio caps.
 
 `GET /api/v1/servers/{instanceId}/backups?cursor=&limit=`
 
@@ -132,7 +134,7 @@ Each file record has `path`, `sha256` (uncompressed bytes), `size`, `role`, and 
 
 ```json
 {
-  "backupDir": "P:\\GManager\\Backups",
+  "backupDir": "C:\\GManager\\data\\backups",
   "keep": 10,
   "items": [{
     "cursor": "20261015T152301.000000000Z",
@@ -147,7 +149,7 @@ Each file record has `path`, `sha256` (uncompressed bytes), `size`, `role`, and 
 }
 ```
 
-Items have ids greater than the request cursor. `nextCursor` is the last item's id, or the request cursor when the page is empty. No backup store is **501** `not_implemented`.
+Items have ids greater than the request cursor. `nextCursor` is the last item's id, or the request cursor when the page is empty. A zip that cannot be read is still listed, with `corrupt: true`, and does not fail the request. No backup store is **501** `not_implemented`.
 
 `POST /api/v1/servers/{instanceId}/backup` accepts any JSON object, including an empty body. The job result includes `action`, `id`, `kind`, `bytes`, `fileCount`, `createdAt`, and `restarted`.
 
@@ -157,9 +159,11 @@ Items have ids greater than the request cursor. `nextCursor` is the last item's 
 {"confirm": true, "id": "20261015T152301.000000000Z"}
 ```
 
+`confirmArchivedSaveDir: true` is optional. Without it, save bytes are written to the save folder configured right now (`--user-dir`, otherwise `userdir` in the current `server.json`). With it, and only when `--user-dir` is unset, an empty or missing directory named by the archived `server.json` may be used instead. A non-empty directory that is not the current save folder is refused.
+
 Missing `confirm: true` is **400** `confirm_required`. A missing id is **400** `backup_id_required`. A malformed id is **400** `invalid_backup_id`. An unknown id is **404** `not_found`. Those checks happen before a job exists.
 
-The job verifies every sha256 before it changes a live file. It then stops the server if it is running, writes a `safety` backup of the current saves and config, and restores. Save bytes go to the directory named by the archived `server.json`, unless `--user-dir` is set, in which case that override wins. Config files are replaced with the archived bytes. The editor records that write, so the next config read is not reported as an external edit. The server is left **stopped**. A failed restore leaves the safety zip in place. A hash mismatch fails the job before the stop, and the live files stay as they were.
+The job verifies every sha256 and the manifest HMAC before it stops the server or changes a live file. It then stops the server if it is running, writes a `safety` backup of the destination it is about to replace, verifies that safety zip, and stages every save root and config file. Those staged copies are swapped into place together. Cancellation is ignored once the swaps start. If a swap fails, the verified safety backup is written back automatically. Config files are replaced with the archived bytes. The editor records that write, so the next config read is not reported as an external edit. A server that was running is started again. A failed restore leaves the safety zip in place. A hash or HMAC mismatch fails the job before the stop, and the live files stay as they were.
 
 Scheduled backups are not in this slice. The writer is the one a scheduler would call.
 
@@ -194,5 +198,5 @@ The store is in memory in this slice. File tailing, websockets, and surviving an
 | `POST .../install` | no | Anonymous SteamCMD install. Does not start the server. |
 | `POST .../update` | no | Stop, backup, update, start. Restores the previous build on failure. |
 | `POST .../backup` | no | Zip saves and config while the server is stopped. A running server is stopped and started again. |
-| `POST .../restore` | yes | Verify the manifest, take a safety backup, restore, leave the server stopped. |
+| `POST .../restore` | yes | Verify the manifest, take a safety backup of the destination, restore into the current save folder, and start the server again if it was running. |
 | `PUT .../config` | no | Validates, merges, and writes as described above. |

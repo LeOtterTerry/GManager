@@ -184,8 +184,9 @@ func (s *Server) postRestore(w http.ResponseWriter, r *http.Request) {
 			}
 			return decision{Status: http.StatusInternalServerError, Body: errorBody{Error: "internal", Message: "could not read backups"}}
 		}
+		useArchived := confirmArchivedSaveDir(body)
 		job := s.jobs.Start("restore", s.instanceID, func(ctx context.Context) (any, error) {
-			return s.restoreWork(ctx, id)
+			return s.restoreWork(ctx, id, useArchived)
 		})
 		return decision{
 			Status: http.StatusAccepted,
@@ -327,8 +328,13 @@ func (s *Server) backupWork(ctx context.Context) (any, error) {
 	})
 }
 
-func (s *Server) restoreWork(ctx context.Context, id string) (any, error) {
+func (s *Server) restoreWork(ctx context.Context, id string, useArchived bool) (any, error) {
 	if err := s.archives.Verify(id); err != nil {
+		return nil, err
+	}
+	current := s.withSaveDir(s.inst)
+	dest, err := s.restoreDest(id, current, useArchived)
+	if err != nil {
 		return nil, err
 	}
 	release, err := s.sup.Hold()
@@ -346,31 +352,30 @@ func (s *Server) restoreWork(ctx context.Context, id string) (any, error) {
 			return nil, stopErr
 		}
 	}
-	inst := s.withSaveDir(s.inst)
-	safety, err := s.createBackup(ctx, inst, backup.KindSafety, []string{id})
+	saves, err := s.mod.SavePaths(dest)
 	if err != nil {
-		if wasRunning {
-			if startErr := s.sup.Start(context.Background(), s.inst, s.mod); startErr != nil {
-				return nil, fmt.Errorf("%w; restart failed: %v", err, startErr)
-			}
-		}
-		return nil, err
+		return nil, s.finishStopped(wasRunning, err)
 	}
-	dest := inst
-	if s.userDir == "" {
-		dir, ok, dirErr := s.archivedSaveDir(id)
-		if dirErr != nil {
-			return nil, fmt.Errorf("safety backup %s was kept: %w", safety.ID, dirErr)
-		}
-		if ok {
-			dest.UserDir = dir
+	for _, root := range saves {
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			return nil, s.finishStopped(wasRunning, err)
 		}
 	}
-	if err := s.archives.Restore(ctx, id, dest, s.mod); err != nil {
-		return nil, fmt.Errorf("safety backup %s was kept: %w", safety.ID, err)
+	safety, err := s.createBackup(ctx, dest, backup.KindSafety, []string{id})
+	if err != nil {
+		return nil, s.finishStopped(wasRunning, err)
+	}
+	if err := s.archives.Verify(safety.ID); err != nil {
+		return nil, s.finishStopped(wasRunning, fmt.Errorf("safety backup %s failed verification: %w", safety.ID, err))
+	}
+	if err := s.archives.RestoreInto(ctx, id, dest, s.mod, safety.ID); err != nil {
+		return nil, s.finishStopped(wasRunning, fmt.Errorf("safety backup %s was kept: %w", safety.ID, err))
 	}
 	if _, err := s.editor.Acknowledge(); err != nil {
-		return nil, fmt.Errorf("files were restored from %s but config state was not updated: %w", id, err)
+		return nil, s.finishStopped(wasRunning, fmt.Errorf("files were restored from %s but config state was not updated: %w", id, err))
+	}
+	if err := s.finishStopped(wasRunning, nil); err != nil {
+		return nil, err
 	}
 	s.logs.Append("restore " + id)
 	return map[string]any{
@@ -379,6 +384,38 @@ func (s *Server) restoreWork(ctx context.Context, id string) (any, error) {
 		"safetyId": safety.ID,
 		"state":    s.sup.Status().State,
 	}, nil
+}
+
+func (s *Server) restoreDest(id string, current core.Instance, useArchived bool) (core.Instance, error) {
+	dest := current
+	if !useArchived || s.userDir != "" {
+		return dest, nil
+	}
+	dir, ok, err := s.archivedSaveDir(id)
+	if err != nil {
+		return core.Instance{}, err
+	}
+	if !ok || backup.SamePath(dir, current.UserDir) {
+		return dest, nil
+	}
+	if err := backup.RefuseForeign(dir); err != nil {
+		return core.Instance{}, err
+	}
+	dest.UserDir = dir
+	return dest, nil
+}
+
+func (s *Server) finishStopped(wasRunning bool, err error) error {
+	if !wasRunning {
+		return err
+	}
+	if startErr := s.sup.Start(context.Background(), s.inst, s.mod); startErr != nil {
+		if err != nil {
+			return fmt.Errorf("%w; restart failed: %v", err, startErr)
+		}
+		return fmt.Errorf("server did not start again: %w", startErr)
+	}
+	return err
 }
 
 func (s *Server) archivedSaveDir(id string) (string, bool, error) {
@@ -450,6 +487,16 @@ func backupResult(entry backup.Entry, restarted bool) map[string]any {
 		"createdAt": entry.CreatedAt,
 		"restarted": restarted,
 	}
+}
+
+func confirmArchivedSaveDir(body []byte) bool {
+	var payload struct {
+		ConfirmArchivedSaveDir bool `json:"confirmArchivedSaveDir"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false
+	}
+	return payload.ConfirmArchivedSaveDir
 }
 
 func backupID(body []byte) (string, error) {

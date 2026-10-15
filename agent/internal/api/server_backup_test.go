@@ -1,6 +1,7 @@
 package api
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -18,7 +19,7 @@ import (
 
 func TestBackupCursorRestoreAndIdempotency(t *testing.T) {
 	save := t.TempDir()
-	archives := &backup.Store{Dir: t.TempDir(), Keep: 10}
+	archives := testArchives(t, 10)
 	_, httpSrv, cfgPath := newAPIOpt(t, 200, Options{Archives: archives})
 	original := configJSON(t, save, "kept")
 	writeCfg(t, cfgPath, original)
@@ -131,7 +132,7 @@ func TestBackupCursorRestoreAndIdempotency(t *testing.T) {
 
 func TestRunningFakeServerBackupAndTamperedRestore(t *testing.T) {
 	save := t.TempDir()
-	archives := &backup.Store{Dir: t.TempDir(), Keep: 10}
+	archives := testArchives(t, 10)
 	srv, httpSrv, cfgPath := newAPIOpt(t, 200, Options{
 		Archives:     archives,
 		ReadyTimeout: 3 * time.Second,
@@ -193,9 +194,83 @@ func TestRunningFakeServerBackupAndTamperedRestore(t *testing.T) {
 	}
 }
 
+func TestRunningRestoreRestartsTheServer(t *testing.T) {
+	save := t.TempDir()
+	archives := testArchives(t, 10)
+	srv, httpSrv, cfgPath := newAPIOpt(t, 200, Options{
+		Archives:     archives,
+		ReadyTimeout: 3 * time.Second,
+	})
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := srv.Supervisor().Stop(ctx); err != nil {
+			t.Errorf("cleanup stop: %v", err)
+		}
+	})
+	inst := filepath.Dir(filepath.Dir(cfgPath))
+	installFake(t, inst)
+	original := configJSON(t, save, "kept")
+	writeCfg(t, cfgPath, original)
+	writeSaveFile(t, save, "world.dat", "alpha")
+
+	status, body, _ := do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/start", "test-token", `{}`, nil)
+	if status != http.StatusAccepted {
+		t.Fatalf("start = %d %s", status, body)
+	}
+	if !bytes.Contains(jobByID(t, httpSrv.URL, jsonString(t, body, "jobId")), []byte(`"state":"succeeded"`)) {
+		t.Fatalf("start job = %s", jobByID(t, httpSrv.URL, jsonString(t, body, "jobId")))
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backup", "test-token", `{}`, nil)
+	if status != http.StatusAccepted {
+		t.Fatalf("backup = %d %s", status, body)
+	}
+	id, _ := succeededResult(t, httpSrv.URL, body)["id"].(string)
+	writeSaveFile(t, save, "world.dat", "live")
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/restore", "test-token", `{"confirm":true,"id":"`+id+`"}`, nil)
+	if status != http.StatusAccepted {
+		t.Fatalf("restore = %d %s", status, body)
+	}
+	result := succeededResult(t, httpSrv.URL, body)
+	if result["state"] != "running" {
+		t.Fatalf("result = %+v", result)
+	}
+	if readSaveFile(t, save, "world.dat") != "alpha" {
+		t.Fatalf("world = %q", readSaveFile(t, save, "world.dat"))
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodGet, "/api/v1/servers/default/status", "test-token", "", nil)
+	if status != http.StatusOK || !bytes.Contains(body, []byte(`"state":"running"`)) {
+		t.Fatalf("status = %d %s", status, body)
+	}
+}
+
+func TestCorruptBackupDoesNotFailTheList(t *testing.T) {
+	save := t.TempDir()
+	archives := testArchives(t, 10)
+	_, httpSrv, cfgPath := newAPIOpt(t, 100, Options{Archives: archives})
+	writeCfg(t, cfgPath, configJSON(t, save, "kept"))
+	writeSaveFile(t, save, "world.dat", "alpha")
+	status, body, _ := do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backup", "test-token", `{}`, nil)
+	if status != http.StatusAccepted {
+		t.Fatalf("backup = %d %s", status, body)
+	}
+	succeededResult(t, httpSrv.URL, body)
+	bad := filepath.Join(archives.Dir, "20261015T010101.000000000Z.zip")
+	if err := os.WriteFile(bad, []byte("not a zip"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodGet, "/api/v1/servers/default/backups", "test-token", "", nil)
+	if status != http.StatusOK {
+		t.Fatalf("list = %d %s", status, body)
+	}
+	if !bytes.Contains(body, []byte(`"corrupt":true`)) || !bytes.Contains(body, []byte(`"kind":"manual"`)) {
+		t.Fatalf("list = %s", body)
+	}
+}
+
 func TestUpdateUsesBackupHook(t *testing.T) {
 	save := t.TempDir()
-	archives := &backup.Store{Dir: t.TempDir(), Keep: 10}
+	archives := testArchives(t, 10)
 	steam := &recordingSteam{exe: fakeBytes(t)}
 	srv, httpSrv, cfgPath := newAPIOpt(t, 200, Options{
 		Archives:     archives,
@@ -238,10 +313,10 @@ func TestUpdateUsesBackupHook(t *testing.T) {
 	}
 }
 
-func TestRestoreUsesTheSaveDirNamedInTheBackup(t *testing.T) {
+func TestRestoreWritesTheCurrentSaveDir(t *testing.T) {
 	saveA := t.TempDir()
 	saveB := t.TempDir()
-	archives := &backup.Store{Dir: t.TempDir(), Keep: 10}
+	archives := testArchives(t, 10)
 	_, httpSrv, cfgPath := newAPIOpt(t, 100, Options{Archives: archives})
 	original := configJSON(t, saveA, "kept")
 	writeCfg(t, cfgPath, original)
@@ -253,7 +328,8 @@ func TestRestoreUsesTheSaveDirNamedInTheBackup(t *testing.T) {
 		t.Fatalf("backup = %d %s", status, body)
 	}
 	id, _ := succeededResult(t, httpSrv.URL, body)["id"].(string)
-	writeCfg(t, cfgPath, configJSON(t, saveB, "moved"))
+	moved := configJSON(t, saveB, "moved")
+	writeCfg(t, cfgPath, moved)
 	writeSaveFile(t, saveA, "world.dat", "mutated")
 	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/restore", "test-token", `{"confirm":true,"id":"`+id+`"}`, nil)
 	if status != http.StatusAccepted {
@@ -262,21 +338,76 @@ func TestRestoreUsesTheSaveDirNamedInTheBackup(t *testing.T) {
 	if job := jobByID(t, httpSrv.URL, jsonString(t, body, "jobId")); !bytes.Contains(job, []byte(`"state":"succeeded"`)) {
 		t.Fatalf("job = %s", job)
 	}
-	if readSaveFile(t, saveA, "world.dat") != "alpha" {
+	if readSaveFile(t, saveA, "world.dat") != "mutated" {
 		t.Fatalf("archived save = %q", readSaveFile(t, saveA, "world.dat"))
 	}
-	if readSaveFile(t, saveB, "world.dat") != "nope" {
-		t.Fatalf("other save = %q", readSaveFile(t, saveB, "world.dat"))
+	if readSaveFile(t, saveB, "world.dat") != "alpha" {
+		t.Fatalf("current save = %q", readSaveFile(t, saveB, "world.dat"))
 	}
 	if mustRead(t, cfgPath) != original {
 		t.Fatalf("config = %s", mustRead(t, cfgPath))
 	}
 }
 
+func TestRestoreRefusesForeignSaveDirUnlessItIsEmpty(t *testing.T) {
+	saveA := t.TempDir()
+	saveB := t.TempDir()
+	archives := testArchives(t, 10)
+	_, httpSrv, cfgPath := newAPIOpt(t, 100, Options{Archives: archives})
+	writeCfg(t, cfgPath, configJSON(t, saveA, "kept"))
+	writeSaveFile(t, saveA, "world.dat", "alpha")
+	writeSaveFile(t, saveB, "world.dat", "nope")
+	status, body, _ := do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backup", "test-token", `{}`, nil)
+	if status != http.StatusAccepted {
+		t.Fatalf("backup = %d %s", status, body)
+	}
+	id, _ := succeededResult(t, httpSrv.URL, body)["id"].(string)
+	moved := configJSON(t, saveB, "moved")
+	writeCfg(t, cfgPath, moved)
+	writeSaveFile(t, saveA, "world.dat", "mutated")
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/restore", "test-token", `{"confirm":true,"confirmArchivedSaveDir":true,"id":"`+id+`"}`, nil)
+	if status != http.StatusAccepted {
+		t.Fatalf("restore = %d %s", status, body)
+	}
+	job := jobByID(t, httpSrv.URL, jsonString(t, body, "jobId"))
+	if !bytes.Contains(job, []byte(`"state":"failed"`)) || !bytes.Contains(job, []byte("not the save folder")) {
+		t.Fatalf("job = %s", job)
+	}
+	if readSaveFile(t, saveA, "world.dat") != "mutated" {
+		t.Fatalf("archived save = %q", readSaveFile(t, saveA, "world.dat"))
+	}
+	if readSaveFile(t, saveB, "world.dat") != "nope" {
+		t.Fatalf("current save = %q", readSaveFile(t, saveB, "world.dat"))
+	}
+	if mustRead(t, cfgPath) != moved {
+		t.Fatal("config changed")
+	}
+
+	if err := os.RemoveAll(saveA); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(saveA, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/restore", "test-token", `{"confirm":true,"confirmArchivedSaveDir":true,"id":"`+id+`"}`, nil)
+	if status != http.StatusAccepted {
+		t.Fatalf("empty restore = %d %s", status, body)
+	}
+	if job := jobByID(t, httpSrv.URL, jsonString(t, body, "jobId")); !bytes.Contains(job, []byte(`"state":"succeeded"`)) {
+		t.Fatalf("job = %s", job)
+	}
+	if readSaveFile(t, saveA, "world.dat") != "alpha" {
+		t.Fatalf("empty archived = %q", readSaveFile(t, saveA, "world.dat"))
+	}
+	if readSaveFile(t, saveB, "world.dat") != "nope" {
+		t.Fatalf("current save = %q", readSaveFile(t, saveB, "world.dat"))
+	}
+}
+
 func TestUserDirOverrideWinsOverConfig(t *testing.T) {
 	flagDir := t.TempDir()
 	configDir := t.TempDir()
-	archives := &backup.Store{Dir: t.TempDir(), Keep: 5}
+	archives := testArchives(t, 5)
 	_, httpSrv, cfgPath := newAPIOpt(t, 50, Options{Archives: archives, UserDir: flagDir})
 	writeCfg(t, cfgPath, configJSON(t, configDir, "kept"))
 	writeSaveFile(t, flagDir, "world.dat", "from-flag")
@@ -309,7 +440,7 @@ func TestUserDirOverrideWinsOverConfig(t *testing.T) {
 }
 
 func TestBackupRequiresAKnownSavePath(t *testing.T) {
-	archives := &backup.Store{Dir: t.TempDir(), Keep: 5}
+	archives := testArchives(t, 5)
 	steam := &recordingSteam{exe: []byte("not-the-game")}
 	_, httpSrv, cfgPath := newAPIOpt(t, 100, Options{Archives: archives, Steam: steam})
 	writeCfg(t, cfgPath, "{\"serverName\":\"kept\"}\n")
@@ -431,17 +562,45 @@ func fakeBytes(t *testing.T) []byte {
 	return b
 }
 
+func testArchives(t *testing.T, keep int) *backup.Store {
+	t.Helper()
+	return &backup.Store{Dir: t.TempDir(), Keep: keep, Key: bytes.Repeat([]byte{3}, 32)}
+}
+
 func flipZip(t *testing.T, path string) {
 	t.Helper()
+	r, err := zip.OpenReader(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var off int64
+	found := false
+	for _, f := range r.File {
+		if f.Name == "manifest.json" || f.UncompressedSize64 == 0 {
+			continue
+		}
+		off, err = f.DataOffset()
+		if err != nil {
+			t.Fatal(err)
+		}
+		found = true
+		break
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("no payload to corrupt")
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(b) < 4 {
-		t.Fatal("zip too small")
+	if off < 0 || int(off) >= len(b) {
+		t.Fatalf("data offset %d outside zip of %d", off, len(b))
 	}
-	b[len(b)/2] ^= 0xff
-	if err := os.WriteFile(path, b, 0o644); err != nil {
+	b[off] ^= 0xff
+	if err := os.WriteFile(path, b, 0o600); err != nil {
 		t.Fatal(err)
 	}
 }

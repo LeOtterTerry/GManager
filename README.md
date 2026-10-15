@@ -56,7 +56,7 @@ Flags: `--data-dir`, `--server-dir`, `--instance` (default `default`), `--ui-por
 
 `--stop-method` defaults to empty, which uses the module. Plains of Pain's clean stop is unknown, so stop kills the process. `interrupt` sends SIGTERM on Unix and is not a confirmed game stop. `--console-commands` adds `-cc`. Leave it off until that flag is confirmed. SteamCMD is stored under `<data-dir>/steamcmd`. Restart and restore require `confirm: true`.
 
-`--backup-dir` is where timestamped zip backups are written. When it is empty and drive `P:` exists, the agent uses `P:\GManager\Backups`. Otherwise it uses `<data-dir>/backups`. `--backup-keep` deletes the oldest zips past that count. `--user-dir` overrides `userdir` from `server.json`. If neither is set, backup and update fail instead of guessing the Plains of Pain save directory. Update stops the server, takes a backup, runs SteamCMD, and starts. A failed update puts the previous build back when the disk has room.
+`--backup-dir` is where timestamped zip backups are written. When it is empty the agent uses `<data-dir>/backups`. The directory must be absolute, must not be a UNC path, and must not overlap the server directory. `--backup-keep` keeps that many zips of each kind and always leaves one that still verifies. `--user-dir` overrides `userdir` from `server.json`. If neither is set, backup and update fail instead of guessing the Plains of Pain save directory. Restore writes saves into that current folder unless `confirmArchivedSaveDir` is set, and a server that was running is started again afterwards. Update stops the server, takes a backup, runs SteamCMD, and starts. A failed update puts the previous build back when the disk has room.
 
 Dashboard, in another terminal:
 

@@ -2,6 +2,7 @@ package backup
 
 import (
 	"archive/zip"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +11,15 @@ import (
 	"io"
 	"os"
 	"time"
+)
+
+// Zip-bomb caps. Tests lower them and restore the previous value.
+var (
+	maxZipEntries    = 100_000
+	maxZipBytes      = uint64(32 << 30)
+	maxZipFileBytes  = uint64(8 << 30)
+	maxZipRatio      = uint64(1000)
+	maxZipRatioFloor = uint64(64 << 20)
 )
 
 // Manifest is the integrity record stored inside every backup zip.
@@ -25,6 +35,7 @@ type Manifest struct {
 	Kind       string         `json:"kind"`
 	Saves      []SaveRoot     `json:"saves"`
 	Files      []ManifestFile `json:"files"`
+	HMAC       string         `json:"hmac,omitempty"`
 }
 
 // SaveRoot is one directory from GameModule.SavePaths, in that order.
@@ -60,7 +71,7 @@ func (a *archive) Close() error {
 	return a.z.Close()
 }
 
-func writeZip(path string, man Manifest, files []sourceFile) (Manifest, error) {
+func writeZip(path string, man Manifest, files []sourceFile, key []byte) (Manifest, error) {
 	// 0600 because the zip contains server.json, including the server password.
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
@@ -86,6 +97,13 @@ func writeZip(path string, man Manifest, files []sourceFile) (Manifest, error) {
 			return Manifest{}, err
 		}
 		man.Files = append(man.Files, entry)
+	}
+	man, err = sealManifest(man, key)
+	if err != nil {
+		if closeErr := zw.Close(); closeErr != nil {
+			return Manifest{}, errors.Join(err, closeErr)
+		}
+		return Manifest{}, err
 	}
 	raw, err := json.MarshalIndent(man, "", "  ")
 	if err != nil {
@@ -157,10 +175,22 @@ func addFile(zw *zip.Writer, src sourceFile) (ManifestFile, error) {
 	return src.entry, nil
 }
 
-func openArchive(path string, hash bool) (*archive, error) {
+type openOpts struct {
+	hash bool
+	mac  bool
+	key  []byte
+}
+
+func openArchive(path string, opt openOpts) (*archive, error) {
 	z, err := zip.OpenReader(path)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrIntegrity, err)
+	}
+	if err := rejectBomb(z.File); err != nil {
+		if closeErr := z.Close(); closeErr != nil {
+			return nil, errors.Join(err, closeErr)
+		}
+		return nil, err
 	}
 	a := &archive{files: map[string]*zip.File{}, z: z}
 	var manifest *zip.File
@@ -201,7 +231,15 @@ func openArchive(path string, hash bool) (*archive, error) {
 		}
 		return nil, err
 	}
-	if err := checkManifest(a.man, a.files, hash); err != nil {
+	if opt.mac {
+		if err := checkManifestMAC(a.man, opt.key); err != nil {
+			if closeErr := a.Close(); closeErr != nil {
+				return nil, errors.Join(err, closeErr)
+			}
+			return nil, err
+		}
+	}
+	if err := checkManifest(a.man, a.files, opt.hash); err != nil {
 		if closeErr := a.Close(); closeErr != nil {
 			return nil, errors.Join(err, closeErr)
 		}
@@ -297,6 +335,9 @@ func checkSaves(man Manifest) error {
 }
 
 func hashZip(f *zip.File) (string, int64, error) {
+	if f.UncompressedSize64 > maxZipFileBytes {
+		return "", 0, errors.New("file too large")
+	}
 	rc, err := f.Open()
 	if err != nil {
 		return "", 0, err
@@ -306,7 +347,73 @@ func hashZip(f *zip.File) (string, int64, error) {
 			return
 		}
 	}()
-	return hashReader(rc)
+	limit := int64(f.UncompressedSize64) + 1
+	return hashReader(io.LimitReader(rc, limit))
+}
+
+func sealManifest(man Manifest, key []byte) (Manifest, error) {
+	sum, err := macManifest(man, key)
+	if err != nil {
+		return Manifest{}, err
+	}
+	man.HMAC = sum
+	return man, nil
+}
+
+func macManifest(man Manifest, key []byte) (string, error) {
+	if len(key) < 32 {
+		return "", errors.New("backup integrity key is not configured")
+	}
+	man.HMAC = ""
+	raw, err := json.Marshal(man)
+	if err != nil {
+		return "", err
+	}
+	m := hmac.New(sha256.New, key)
+	if _, err := m.Write(raw); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(m.Sum(nil)), nil
+}
+
+func checkManifestMAC(man Manifest, key []byte) error {
+	if man.HMAC == "" {
+		return fmt.Errorf("%w: manifest hmac missing", ErrIntegrity)
+	}
+	sum, err := macManifest(man, key)
+	if err != nil {
+		return err
+	}
+	if !hmac.Equal([]byte(sum), []byte(man.HMAC)) {
+		return fmt.Errorf("%w: manifest hmac", ErrIntegrity)
+	}
+	return nil
+}
+
+func rejectBomb(files []*zip.File) error {
+	if len(files) > maxZipEntries {
+		return fmt.Errorf("%w: too many entries", ErrIntegrity)
+	}
+	var raw, packed uint64
+	for _, f := range files {
+		if f.UncompressedSize64 > maxZipFileBytes {
+			return fmt.Errorf("%w: %s is too large", ErrIntegrity, f.Name)
+		}
+		next, err := addSize(raw, f.UncompressedSize64)
+		if err != nil || next > maxZipBytes {
+			return fmt.Errorf("%w: uncompressed size", ErrIntegrity)
+		}
+		raw = next
+		nextPacked, err := addSize(packed, f.CompressedSize64)
+		if err != nil {
+			return fmt.Errorf("%w: compressed size", ErrIntegrity)
+		}
+		packed = nextPacked
+	}
+	if raw > maxZipRatioFloor && packed > 0 && raw/packed > maxZipRatio {
+		return fmt.Errorf("%w: compression ratio", ErrIntegrity)
+	}
+	return nil
 }
 
 func hashReader(r io.Reader) (string, int64, error) {

@@ -39,13 +39,24 @@ func (s *Store) Config(id, rel string) ([]byte, error) {
 }
 
 // Restore checks the manifest, then replaces save directories and config
-// files with the archived bytes. Verification finishes before the first
-// write. A hash mismatch leaves the live files alone.
-// inst.UserDir selects where save bytes are written. That should be the
-// directory named by the archived config, unless the operator overrode it.
+// files with the archived bytes. Save bytes are written to inst.UserDir,
+// which must already be the directory the operator chose. Verification
+// finishes before the first write. A hash mismatch leaves the live files alone.
 func (s *Store) Restore(ctx context.Context, id string, inst core.Instance, mod core.GameModule) error {
+	return s.RestoreInto(ctx, id, inst, mod, "")
+}
+
+// RestoreInto is Restore with an automatic rollback. safetyID is a backup of
+// the destination taken before this call and already verified by the caller.
+// Staging is cancellable. Once the swaps start, cancellation is ignored. If a
+// swap fails and safetyID is set, that backup is written back over the
+// destination.
+func (s *Store) RestoreInto(ctx context.Context, id string, inst core.Instance, mod core.GameModule, safetyID string) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if safetyID != "" && safetyID == id {
+		return errors.New("safety backup must be a different archive")
 	}
 	if mod == nil {
 		return errors.New("module is required")
@@ -59,75 +70,461 @@ func (s *Store) Restore(ctx context.Context, id string, inst core.Instance, mod 
 			return
 		}
 	}()
-	saves, err := mod.SavePaths(inst)
+	var safety *archive
+	if safetyID != "" {
+		safety, err = s.openVerified(safetyID)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if closeErr := safety.Close(); closeErr != nil {
+				return
+			}
+		}()
+	}
+	plan, err := prepare(ctx, a, inst, mod, s.Dir, s.ensureSpace)
 	if err != nil {
 		return err
 	}
+	staged, err := stageAll(ctx, a, plan)
+	if err != nil {
+		if discardErr := staged.discard(); discardErr != nil {
+			return errors.Join(err, discardErr)
+		}
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		if discardErr := staged.discard(); discardErr != nil {
+			return errors.Join(err, discardErr)
+		}
+		return err
+	}
+	// Swaps are the point of no return for cancellation. A failure rolls
+	// the destination back from the safety archive when one was provided.
+	if err := s.commit(staged); err != nil {
+		if staged.dirty && safety != nil {
+			rbErr := s.apply(safety, plan)
+			if discardErr := staged.discard(); discardErr != nil {
+				rbErr = errors.Join(rbErr, discardErr)
+			}
+			if holdErr := staged.removeHolds(); holdErr != nil {
+				rbErr = errors.Join(rbErr, holdErr)
+			}
+			if rbErr != nil {
+				return fmt.Errorf("%w; rollback from safety backup %s failed: %v", err, safetyID, rbErr)
+			}
+			return fmt.Errorf("%w; rolled back from safety backup %s", err, safetyID)
+		}
+		undoErr := staged.undo()
+		if discardErr := staged.discard(); discardErr != nil {
+			undoErr = errors.Join(undoErr, discardErr)
+		}
+		if undoErr != nil {
+			return errors.Join(err, undoErr)
+		}
+		return err
+	}
+	if err := staged.removeHolds(); err != nil {
+		return fmt.Errorf("restored files are in place, removing the previous copy failed: %w", err)
+	}
+	return nil
+}
+
+type restorePlan struct {
+	saves   []string
+	configs []configDest
+}
+
+type configDest struct {
+	rel string
+	abs string
+}
+
+func prepare(ctx context.Context, a *archive, inst core.Instance, mod core.GameModule, backupDir string, ensure func(string, uint64) error) (restorePlan, error) {
+	if err := ctx.Err(); err != nil {
+		return restorePlan{}, err
+	}
+	saves, err := mod.SavePaths(inst)
+	if err != nil {
+		return restorePlan{}, err
+	}
 	if len(saves) != len(a.man.Saves) {
-		return fmt.Errorf("backup has %d save directories, the config now has %d", len(a.man.Saves), len(saves))
+		return restorePlan{}, fmt.Errorf("backup has %d save directories, the config now has %d", len(a.man.Saves), len(saves))
 	}
 	configs := mod.ConfigFiles(inst)
 	if err := matchConfigs(a.man, configs); err != nil {
-		return err
+		return restorePlan{}, err
 	}
+	plan := restorePlan{saves: saves}
 	for i, root := range saves {
-		info, statErr := os.Stat(root)
+		info, statErr := os.Lstat(root)
 		if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
-			return statErr
+			return restorePlan{}, statErr
+		}
+		if statErr == nil && info.Mode()&os.ModeSymlink != 0 {
+			return restorePlan{}, fmt.Errorf("save path %s is a symlink", root)
 		}
 		if statErr == nil && !info.IsDir() {
-			return fmt.Errorf("save path %s is not a directory", root)
+			return restorePlan{}, fmt.Errorf("save path %s is not a directory", root)
 		}
-		if err := guardSaveRoot(inst.Dir, s.Dir, root); err != nil {
-			return err
+		if err := guardSaveRoot(inst.Dir, backupDir, root); err != nil {
+			return restorePlan{}, err
 		}
 		total, n := bytesFor(a.man, roleSave, i)
 		need, err := spaceNeed(total, n)
 		if err != nil {
-			return err
+			return restorePlan{}, err
 		}
 		check := root
 		if errors.Is(statErr, os.ErrNotExist) {
 			check = filepath.Dir(root)
 		}
-		if err := s.ensureSpace(check, need); err != nil {
-			return err
+		if err := ensure(check, need); err != nil {
+			return restorePlan{}, err
 		}
 	}
 	for _, cf := range configs {
 		rel := filepath.ToSlash(cf.RelPath)
 		abs := filepath.Join(inst.Dir, filepath.FromSlash(rel))
 		if err := within(inst.Dir, abs); err != nil {
-			return err
+			return restorePlan{}, err
 		}
 		total, n := configBytes(a.man, rel)
 		need, err := spaceNeed(total, n)
 		if err != nil {
-			return err
+			return restorePlan{}, err
 		}
-		if err := s.ensureSpace(abs, need); err != nil {
-			return err
+		if err := ensure(abs, need); err != nil {
+			return restorePlan{}, err
+		}
+		plan.configs = append(plan.configs, configDest{rel: rel, abs: abs})
+	}
+	return plan, nil
+}
+
+type stagedSet struct {
+	dirs  []stagedDir
+	files []stagedFile
+	dirty bool
+}
+
+type stagedDir struct {
+	dest    string
+	tmp     string
+	hold    string
+	swapped bool
+}
+
+type stagedFile struct {
+	dest    string
+	tmp     string
+	hold    string
+	swapped bool
+}
+
+func stageAll(ctx context.Context, a *archive, plan restorePlan) (*stagedSet, error) {
+	st := &stagedSet{}
+	for i, root := range plan.saves {
+		if err := ctx.Err(); err != nil {
+			return st, err
+		}
+		dir, err := stageSave(a, i, root)
+		if err != nil {
+			return st, err
+		}
+		st.dirs = append(st.dirs, dir)
+	}
+	for _, cf := range plan.configs {
+		if err := ctx.Err(); err != nil {
+			return st, err
+		}
+		file, err := stageConfig(a, cf)
+		if err != nil {
+			return st, err
+		}
+		st.files = append(st.files, file)
+	}
+	return st, nil
+}
+
+func stageSave(a *archive, index int, dest string) (stagedDir, error) {
+	parent := filepath.Dir(dest)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return stagedDir{}, err
+	}
+	tmp, err := os.MkdirTemp(parent, ".gmanager-restore-*")
+	if err != nil {
+		return stagedDir{}, err
+	}
+	for _, f := range a.man.Files {
+		if f.Role != roleSave || f.Root != index {
+			continue
+		}
+		target := filepath.Join(tmp, filepath.FromSlash(f.Rel))
+		if err := within(tmp, target); err != nil {
+			if rmErr := os.RemoveAll(tmp); rmErr != nil {
+				return stagedDir{}, errors.Join(err, rmErr)
+			}
+			return stagedDir{}, err
+		}
+		if err := extractChecked(a, f, target); err != nil {
+			if rmErr := os.RemoveAll(tmp); rmErr != nil {
+				return stagedDir{}, errors.Join(err, rmErr)
+			}
+			return stagedDir{}, err
 		}
 	}
-	for i, root := range saves {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := restoreSave(a, i, root); err != nil {
-			return err
+	return stagedDir{dest: dest, tmp: tmp}, nil
+}
+
+func stageConfig(a *archive, dest configDest) (stagedFile, error) {
+	var file ManifestFile
+	found := false
+	for _, f := range a.man.Files {
+		if f.Role == roleConfig && f.Rel == dest.rel {
+			file = f
+			found = true
+			break
 		}
 	}
-	for _, cf := range configs {
-		if err := ctx.Err(); err != nil {
+	if !found {
+		return stagedFile{}, fmt.Errorf("backup is missing config %s", dest.rel)
+	}
+	parent := filepath.Dir(dest.abs)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return stagedFile{}, err
+	}
+	tmp, err := os.CreateTemp(parent, ".gmanager-restore-*.tmp")
+	if err != nil {
+		return stagedFile{}, err
+	}
+	tmpName := tmp.Name()
+	if err := tmp.Close(); err != nil {
+		if removeErr := os.Remove(tmpName); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return stagedFile{}, errors.Join(err, removeErr)
+		}
+		return stagedFile{}, err
+	}
+	if err := os.Remove(tmpName); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return stagedFile{}, err
+	}
+	if err := extractChecked(a, file, tmpName); err != nil {
+		return stagedFile{}, err
+	}
+	return stagedFile{dest: dest.abs, tmp: tmpName}, nil
+}
+
+func (s *Store) commit(st *stagedSet) error {
+	for i := range st.dirs {
+		if err := s.beforeSwap(); err != nil {
 			return err
 		}
-		rel := filepath.ToSlash(cf.RelPath)
-		abs := filepath.Join(inst.Dir, filepath.FromSlash(rel))
-		if err := restoreConfig(a, rel, abs); err != nil {
+		hold, err := swapPath(st.dirs[i].dest, st.dirs[i].tmp, true)
+		st.dirs[i].hold = hold
+		if err != nil {
+			if hold != "" {
+				st.dirty = true
+			}
 			return err
 		}
+		st.dirs[i].swapped = true
+		st.dirty = true
+	}
+	for i := range st.files {
+		if err := s.beforeSwap(); err != nil {
+			return err
+		}
+		hold, err := swapPath(st.files[i].dest, st.files[i].tmp, false)
+		st.files[i].hold = hold
+		if err != nil {
+			if hold != "" {
+				st.dirty = true
+			}
+			return err
+		}
+		st.files[i].swapped = true
+		st.dirty = true
 	}
 	return nil
+}
+
+func (s *Store) beforeSwap() error {
+	if s.swapFail == nil {
+		return nil
+	}
+	return s.swapFail()
+}
+
+func (s *Store) apply(a *archive, plan restorePlan) error {
+	prev := s.swapFail
+	s.swapFail = nil
+	defer func() { s.swapFail = prev }()
+	staged, err := stageAll(context.Background(), a, plan)
+	if err != nil {
+		if discardErr := staged.discard(); discardErr != nil {
+			return errors.Join(err, discardErr)
+		}
+		return err
+	}
+	if err := s.commit(staged); err != nil {
+		undoErr := staged.undo()
+		if discardErr := staged.discard(); discardErr != nil {
+			undoErr = errors.Join(undoErr, discardErr)
+		}
+		if undoErr != nil {
+			return errors.Join(err, undoErr)
+		}
+		return err
+	}
+	if err := staged.removeHolds(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (st *stagedSet) discard() error {
+	if st == nil {
+		return nil
+	}
+	var err error
+	for i := range st.dirs {
+		if st.dirs[i].swapped || st.dirs[i].tmp == "" {
+			continue
+		}
+		if rmErr := os.RemoveAll(st.dirs[i].tmp); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			err = errors.Join(err, rmErr)
+		}
+	}
+	for i := range st.files {
+		if st.files[i].swapped || st.files[i].tmp == "" {
+			continue
+		}
+		if rmErr := os.Remove(st.files[i].tmp); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			err = errors.Join(err, rmErr)
+		}
+	}
+	return err
+}
+
+func (st *stagedSet) removeHolds() error {
+	if st == nil {
+		return nil
+	}
+	var err error
+	for i := range st.dirs {
+		err = errors.Join(err, removeHold(st.dirs[i].hold))
+	}
+	for i := range st.files {
+		err = errors.Join(err, removeHold(st.files[i].hold))
+	}
+	return err
+}
+
+func removeHold(hold string) error {
+	if hold == "" {
+		return nil
+	}
+	if err := os.RemoveAll(hold); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func (st *stagedSet) undo() error {
+	if st == nil {
+		return nil
+	}
+	var err error
+	for i := len(st.files) - 1; i >= 0; i-- {
+		if undoErr := undoSwapped(st.files[i].dest, st.files[i].hold, st.files[i].swapped); undoErr != nil {
+			err = errors.Join(err, undoErr)
+		}
+	}
+	for i := len(st.dirs) - 1; i >= 0; i-- {
+		if undoErr := undoSwapped(st.dirs[i].dest, st.dirs[i].hold, st.dirs[i].swapped); undoErr != nil {
+			err = errors.Join(err, undoErr)
+		}
+	}
+	return err
+}
+
+func undoSwapped(dest, hold string, swapped bool) error {
+	if !swapped {
+		return nil
+	}
+	if hold == "" {
+		if err := os.RemoveAll(dest); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	if _, err := os.Stat(hold); err != nil {
+		return fmt.Errorf("previous copy of %s is missing: %w", dest, err)
+	}
+	junk := dest + ".gmanager-undo"
+	if err := os.RemoveAll(junk); err != nil {
+		return err
+	}
+	if _, err := os.Stat(dest); err == nil {
+		if err := renameRetry(dest, junk); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := renameRetry(hold, dest); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(junk); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return syncDir(filepath.Dir(dest))
+}
+
+func swapPath(dest, src string, dir bool) (string, error) {
+	info, err := os.Lstat(dest)
+	if errors.Is(err, os.ErrNotExist) {
+		if mkErr := os.MkdirAll(filepath.Dir(dest), 0o755); mkErr != nil {
+			return "", mkErr
+		}
+		if err := renameRetry(src, dest); err != nil {
+			return "", err
+		}
+		if err := syncDir(filepath.Dir(dest)); err != nil {
+			return "", err
+		}
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if dir && !info.IsDir() {
+		return "", fmt.Errorf("save path %s is not a directory", dest)
+	}
+	if !dir && info.IsDir() {
+		return "", fmt.Errorf("config path %s is a directory", dest)
+	}
+	hold := holdPath(dest)
+	if err := os.RemoveAll(hold); err != nil {
+		return "", err
+	}
+	if err := renameRetry(dest, hold); err != nil {
+		return "", err
+	}
+	if err := renameRetry(src, dest); err != nil {
+		if backErr := renameRetry(hold, dest); backErr != nil {
+			return hold, fmt.Errorf("move restored data into place: %v; putting the previous data back failed: %w", err, backErr)
+		}
+		return "", err
+	}
+	if err := syncDir(filepath.Dir(dest)); err != nil {
+		return hold, err
+	}
+	return hold, nil
+}
+
+func holdPath(dest string) string {
+	return filepath.Join(filepath.Dir(dest), ".gmanager-hold-"+filepath.Base(dest))
 }
 
 func matchConfigs(man Manifest, files []core.ConfigFile) error {
@@ -185,85 +582,6 @@ func configBytes(man Manifest, rel string) (uint64, int) {
 	return total, n
 }
 
-func restoreSave(a *archive, index int, dest string) error {
-	parent := filepath.Dir(dest)
-	if err := os.MkdirAll(parent, 0o755); err != nil {
-		return err
-	}
-	tmp, err := os.MkdirTemp(parent, ".gmanager-restore-*")
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if committed {
-			return
-		}
-		if removeErr := os.RemoveAll(tmp); removeErr != nil {
-			return
-		}
-	}()
-	for _, f := range a.man.Files {
-		if f.Role != roleSave || f.Root != index {
-			continue
-		}
-		target := filepath.Join(tmp, filepath.FromSlash(f.Rel))
-		if err := within(tmp, target); err != nil {
-			return err
-		}
-		if err := extractChecked(a, f, target); err != nil {
-			return err
-		}
-	}
-	if err := replaceDir(dest, tmp); err != nil {
-		return err
-	}
-	committed = true
-	return nil
-}
-
-func restoreConfig(a *archive, rel, dest string) error {
-	var file ManifestFile
-	found := false
-	for _, f := range a.man.Files {
-		if f.Role == roleConfig && f.Rel == rel {
-			file = f
-			found = true
-			break
-		}
-	}
-	if !found {
-		return fmt.Errorf("backup is missing config %s", rel)
-	}
-	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(dest), ".gmanager-restore-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	if err := tmp.Close(); err != nil {
-		if removeErr := os.Remove(tmpName); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			return errors.Join(err, removeErr)
-		}
-		return err
-	}
-	if err := os.Remove(tmpName); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	if err := extractChecked(a, file, tmpName); err != nil {
-		return err
-	}
-	if err := replaceFile(tmpName, dest); err != nil {
-		if removeErr := os.Remove(tmpName); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			return errors.Join(err, removeErr)
-		}
-		return err
-	}
-	return nil
-}
-
 func readChecked(a *archive, f ManifestFile) ([]byte, error) {
 	zf, ok := a.files[f.Path]
 	if !ok {
@@ -312,31 +630,6 @@ func extractChecked(a *archive, f ManifestFile, dest string) error {
 			return errors.Join(fmt.Errorf("%w: %s", ErrIntegrity, f.Path), removeErr)
 		}
 		return fmt.Errorf("%w: %s", ErrIntegrity, f.Path)
-	}
-	return nil
-}
-
-func replaceDir(dest, src string) error {
-	if _, err := os.Stat(dest); errors.Is(err, os.ErrNotExist) {
-		return os.Rename(src, dest)
-	} else if err != nil {
-		return err
-	}
-	hold := filepath.Join(filepath.Dir(dest), ".gmanager-hold-"+filepath.Base(dest))
-	if err := os.RemoveAll(hold); err != nil {
-		return err
-	}
-	if err := os.Rename(dest, hold); err != nil {
-		return err
-	}
-	if err := os.Rename(src, dest); err != nil {
-		if backErr := os.Rename(hold, dest); backErr != nil {
-			return fmt.Errorf("move restored save into place: %v; putting the previous save back failed: %w", err, backErr)
-		}
-		return err
-	}
-	if err := os.RemoveAll(hold); err != nil {
-		return fmt.Errorf("restored save is in place, removing the previous copy failed: %w", err)
 	}
 	return nil
 }
