@@ -22,7 +22,7 @@ MIT. See [LICENSE](LICENSE).
 ## Layout
 
 ```
-agent/          Go module. cmd/gmanager, cmd/fakeserver, supervisor, steamcmd, local API
+agent/          Go module. cmd/gmanager, cmd/fakeserver, supervisor, steamcmd, backups, local API
 agent/modules/plainsofpain
 web/            Dashboard shell (TypeScript + Vite)
 docs/           Scope, architecture, API
@@ -52,9 +52,11 @@ Defaults:
 - revision metadata: `<data-dir>/state/default/server.json.meta`
 - token file, when generated: `<data-dir>/token`
 
-Flags: `--data-dir`, `--server-dir`, `--instance` (default `default`), `--ui-port` (default `5173`), `--stop-method` (empty, or `interrupt`), `--console-commands` (default false), `--steamcmd-timeout` (default `60m`). An instance id starts with a letter or digit and may contain letters, digits, `_`, and `-`, up to 64 characters. The API accepts a browser `Origin` only on `--ui-port`.
+Flags: `--data-dir`, `--server-dir`, `--instance` (default `default`), `--ui-port` (default `5173`), `--stop-method` (empty, or `interrupt`), `--console-commands` (default false), `--steamcmd-timeout` (default `60m`), `--backup-dir`, `--backup-keep` (default `10`), `--user-dir`. An instance id starts with a letter or digit and may contain letters, digits, `_`, and `-`, up to 64 characters. The API accepts a browser `Origin` only on `--ui-port`.
 
-`--stop-method` defaults to empty, which uses the module. Plains of Pain's clean stop is unknown, so stop kills the process. `interrupt` sends SIGTERM on Unix and is not a confirmed game stop. `--console-commands` adds `-cc`. Leave it off until that flag is confirmed. SteamCMD is stored under `<data-dir>/steamcmd`. Restart requires `confirm: true`. Update returns 501 until a backup hook exists; the agent does not invent one.
+`--stop-method` defaults to empty, which uses the module. Plains of Pain's clean stop is unknown, so stop kills the process. `interrupt` sends SIGTERM on Unix and is not a confirmed game stop. `--console-commands` adds `-cc`. Leave it off until that flag is confirmed. SteamCMD is stored under `<data-dir>/steamcmd`. Restart and restore require `confirm: true`.
+
+`--backup-dir` is where timestamped zip backups are written. When it is empty the agent uses `<data-dir>/backups`. The directory must be absolute, must not be a UNC path, and must not overlap the server directory. `--backup-keep` keeps that many zips of each kind and always leaves one that still verifies. A zip that cannot be verified is quarantined instead of deleted. `POST .../backups/discard` removes a quarantined zip, and `POST .../backups/release` puts one back. An unsigned zip stays unsigned until `POST .../backups/sign`. That call shows the manifest and file sha256 first; confirming sends the preview digest, and a zip newer than the integrity key is refused. The HMAC key is `<data-dir>/backup.hmac`, copied to `backup.hmac.bak` and `<data-dir>/integrity.key`; if every copy is missing and backups already exist, the agent does not generate a new key. `--user-dir` overrides `userdir` from `server.json`. If neither is set, backup and update fail instead of guessing the Plains of Pain save directory. Restore writes saves into that current folder unless `confirmArchivedSaveDir` is set, rewrites `userdir` to that folder when it differs, and records an owner-only HMAC journal at `<data-dir>/.gmanager-restore-journal-<instance>` before the first swap. The expected restore id is stored per instance. The journal file is removed before that id is rotated. A bad journal or any other startup failure while reading it is logged and blocks only that restore until it is resolved; it does not stop the agent. `POST .../backups/journal` shows the journal. Rollback of a stale id echoes the preview restore id. Discard removes an unusable, finished, or idle journal. A hold that is already on disk counts as swapped, so a crash before that swap was recorded is refused unless `force` and that restore id are sent. An unverified discard is logged. `POST .../backups/discard-hold` previews one stray hold and deletes it only when the confirmed size and modification time match. That time is compared as Unix nanoseconds. The destination must not look mid-restore. `POST .../backups/discard-staging` previews unjournaled `.gmanager-restore-*` leftovers and, with confirm, removes them without following links. Restore and those journal calls take the same lock. The key's creation time is stored in HMAC'd metadata, and signing uses that time. A server that was running is started again afterwards. Update stops the server, takes a backup, runs SteamCMD, and starts. A failed update puts the previous build back when the disk has room.
 
 Dashboard, in another terminal:
 
@@ -75,7 +77,7 @@ cd agent && go test ./...
 cd web && npm run build
 ```
 
-Config validation and the external-edit safeguard are covered in `agent/modules/plainsofpain` and `agent/internal/config`. The API tests cover 202 jobs, idempotency, `If-Match` 409, cursor logs, confirm, and 429. CI also runs `go test ./...` on `windows-latest`, which builds and runs the Windows-only files.
+Config validation and the external-edit safeguard are covered in `agent/modules/plainsofpain` and `agent/internal/config`. The API tests cover 202 jobs, idempotency, `If-Match` 409, cursor logs, cursor-paged backups, confirm, and 429. Backup and restore tests use `agent/cmd/fakeserver`, including a running server that is stopped for the zip and started again. CI also runs `go test ./...` on `windows-latest`, which builds and runs the Windows-only files.
 
 Process tests use `agent/cmd/fakeserver`, a small stand-in that prints `Set Game State: RUNNING` and can crash, hang, or exit on an interrupt. Those tests do not contact Steam. SteamCMD tests extract a local archive or run a stand-in script.
 
@@ -85,7 +87,7 @@ These stay configurable and unresolved until a real Plains of Pain install confi
 
 | Topic | Behavior in this slice |
 |---|---|
-| Default save path | `SavePaths` returns an error unless `userdir` is set. No default path is invented. |
+| Default save path | `SavePaths` returns an error unless `userdir` or `--user-dir` is set. No default path is invented. |
 | Clean stop on Windows | `StopStrategy` method is unknown. Stop kills the process (`TerminateJobObject` on Windows, `SIGKILL` on Unix). |
 | `-cc` console flag | Omitted unless the instance sets `EnableConsoleCommands`. Off by default. |
 | `adminAccountIDs` format | Preserved verbatim. Not type-checked. Fixtures use `STEAM64_PLACEHOLDER`, never a real Steam ID. |
@@ -98,7 +100,7 @@ These stay configurable and unresolved until a real Plains of Pain install confi
 - Containing a real Plains of Pain process tree (the fakeserver runs in a job object; the game is unverified)
 - Dashboard login (Argon2id, cookies, CSRF) and `reset-password`
 - Config form and 3-way diff UI
-- Backups, restore, scheduled restart
+- Scheduled backups and scheduled restart
 - Log file capture and WebSocket tail
 - PowerShell module
 - Network and CGNAT check

@@ -264,6 +264,51 @@ func (e *Editor) Save(revision int64, editJSON []byte, resolutions map[string]st
 	return SaveResult{Revision: st.Revision, SHA256: st.SHA256, Body: append([]byte(nil), written.body...), Written: true}, nil
 }
 
+// Acknowledge records the current on-disk file as written by the agent.
+// Restore calls this after it replaces server.json so the next read does not
+// treat that restore as a manual edit. The config file is not rewritten.
+// A missing file returns ErrExternalDelete.
+func (e *Editor) Acknowledge() (ReadResult, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	st, exists, err := e.load()
+	if err != nil {
+		return ReadResult{}, err
+	}
+	disk, err := e.readDisk()
+	if err != nil {
+		return ReadResult{}, err
+	}
+	if disk.absent {
+		return ReadResult{}, ErrExternalDelete
+	}
+	if !exists {
+		st = acknowledge(disk, 1)
+		if err := e.persist(st); err != nil {
+			return ReadResult{}, err
+		}
+		return resultFrom(st, disk, false), nil
+	}
+	rehydrate(st, disk)
+	if !drifted(st, disk) {
+		if st.Drift {
+			st.Drift = false
+			st.DriftSHA = ""
+			if err := e.persist(st); err != nil {
+				return ReadResult{}, err
+			}
+		}
+		return resultFrom(st, disk, false), nil
+	}
+	st.Revision++
+	adopt(st, disk)
+	if err := e.persist(st); err != nil {
+		return ReadResult{}, err
+	}
+	return resultFrom(st, disk, false), nil
+}
+
 func resultFrom(st *snapshot, disk diskFile, external bool) ReadResult {
 	res := ReadResult{
 		Revision:       st.Revision,

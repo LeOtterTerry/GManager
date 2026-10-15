@@ -2,10 +2,14 @@
 
 package main
 
-import "os"
+import (
+	"os"
+
+	"github.com/LeOtterTerry/GManager/agent/internal/owner"
+)
 
 func restrictToOwner(path string) error {
-	return os.Chmod(path, 0o600)
+	return owner.Restrict(path)
 }
 
 func tokenOpenToOthers(path string) (bool, error) {

@@ -80,6 +80,7 @@ type Status struct {
 // back into the supervisor.
 type Supervisor struct {
 	mu       sync.Mutex
+	maint    sync.Mutex
 	policy   Policy
 	log      func(string)
 	override core.StopMethod
@@ -220,6 +221,55 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 		return errors.New("process did not exit")
 	}
 	return nil
+}
+
+// Hold keeps install, update, backup, and restore from running together.
+// It does not wait. The returned function releases the hold.
+func (s *Supervisor) Hold() (func(), error) {
+	if !s.maint.TryLock() {
+		return nil, ErrBusy
+	}
+	return s.maint.Unlock, nil
+}
+
+// RunStopped runs fn while the game process is stopped.
+// When the server was running or starting, it is stopped first and started
+// again afterward. A failure from fn still attempts that restart. The restart
+// uses a fresh context so a cancelled backup can bring the process back.
+// wasRunning is true when a restart was required.
+func (s *Supervisor) RunStopped(ctx context.Context, fn func(context.Context) error) (wasRunning bool, err error) {
+	if fn == nil {
+		return false, errors.New("missing function")
+	}
+	release, err := s.Hold()
+	if err != nil {
+		return false, err
+	}
+	defer release()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.mu.Lock()
+	wasRunning = s.state == StateRunning || s.state == StateStarting
+	inst := s.inst
+	mod := s.mod
+	s.mu.Unlock()
+	if wasRunning {
+		if err := s.Stop(ctx); err != nil {
+			return true, err
+		}
+	}
+	err = fn(ctx)
+	if !wasRunning {
+		return false, err
+	}
+	if startErr := s.start(context.Background(), inst, mod, false); startErr != nil {
+		if err != nil {
+			return true, fmt.Errorf("%w; restart failed: %v", err, startErr)
+		}
+		return true, fmt.Errorf("server did not start again: %w", startErr)
+	}
+	return true, err
 }
 
 // Restart stops, then starts the attached instance.

@@ -195,8 +195,9 @@ func (m *recordingModule) CrashSignals() []*regexp.Regexp { return nil }
 func (m *recordingModule) SavePaths(core.Instance) ([]string, error) {
 	return nil, core.ErrSavePathUnknown
 }
-func (m *recordingModule) Ports([]byte) []core.PortSpec { return nil }
-func (m *recordingModule) Warnings([]byte) []string     { return nil }
+func (m *recordingModule) ConfigSaveDir([]byte) (string, bool) { return "", false }
+func (m *recordingModule) Ports([]byte) []core.PortSpec        { return nil }
+func (m *recordingModule) Warnings([]byte) []string            { return nil }
 
 func newFake(t *testing.T, behavior string) core.Instance {
 	t.Helper()

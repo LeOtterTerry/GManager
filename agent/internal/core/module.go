@@ -34,6 +34,11 @@ type GameModule interface {
 	// A non-nil error means the location is not known. Do not guess.
 	SavePaths(inst Instance) ([]string, error)
 
+	// ConfigSaveDir returns the save directory named in cfg.
+	// The boolean is false when cfg does not name one.
+	// Callers must not invent a path when the boolean is false.
+	ConfigSaveDir(cfg []byte) (string, bool)
+
 	Ports(cfg []byte) []PortSpec
 	Warnings(cfg []byte) []string
 }

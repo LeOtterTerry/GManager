@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/LeOtterTerry/GManager/agent/internal/api"
+	"github.com/LeOtterTerry/GManager/agent/internal/backup"
 	"github.com/LeOtterTerry/GManager/agent/internal/config"
 	"github.com/LeOtterTerry/GManager/agent/internal/core"
 	"github.com/LeOtterTerry/GManager/agent/internal/steamcmd"
@@ -35,6 +36,9 @@ func main() {
 	stopMethod := flag.String("stop-method", "", "stop override: empty uses the module; interrupt is SIGTERM on Unix and is not a confirmed Plains of Pain clean stop")
 	console := flag.Bool("console-commands", false, "pass -cc (UNVERIFIED on Windows; default false)")
 	steamTimeout := flag.Duration("steamcmd-timeout", steamcmd.DefaultRunTimeout, "maximum time for one SteamCMD install or update")
+	backupDir := flag.String("backup-dir", "", "backup directory (default <data-dir>/backups). Must be absolute, not a UNC path, and not inside the server directory")
+	backupKeep := flag.Int("backup-keep", backup.DefaultKeep, "how many backups to keep; the oldest are deleted past this count")
+	userDir := flag.String("user-dir", "", "save directory override; empty reads userdir from server.json. The game's default save path is unverified")
 	flag.Parse()
 
 	dirData := *dataDir
@@ -61,6 +65,9 @@ func main() {
 	if *steamTimeout <= 0 {
 		stderr.Fatal("steamcmd-timeout must be positive")
 	}
+	if *backupKeep < 1 {
+		stderr.Fatal("backup-keep must be at least 1")
+	}
 	switch core.StopMethod(*stopMethod) {
 	case core.StopUnknown, core.StopInterrupt:
 	default:
@@ -71,6 +78,11 @@ func main() {
 	if dir == "" {
 		dir = filepath.Join(dirData, "servers", *instance)
 	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		stderr.Fatal(err)
+	}
+	dir = absDir
 	mod := plainsofpain.New()
 	mod.ManagerAPIPort = apiPort
 	mod.ManagerUIPort = *uiPort
@@ -88,22 +100,66 @@ func main() {
 	sup.SetStopMethod(core.StopMethod(*stopMethod))
 	steam := steamcmd.New(filepath.Join(dirData, "steamcmd"))
 	steam.Timeout = *steamTimeout
+	dirBackup := *backupDir
+	if dirBackup == "" {
+		dirBackup = backup.DefaultDir(dirData)
+	}
+	dirBackup, err = filepath.Abs(dirBackup)
+	if err != nil {
+		stderr.Fatal(err)
+	}
+	if err := backup.ValidateDir(dirBackup, dir); err != nil {
+		stderr.Fatal(err)
+	}
+	inst := core.Instance{
+		ID:                    *instance,
+		Dir:                   dir,
+		EnableConsoleCommands: *console,
+	}
+	if *userDir != "" {
+		inst.UserDir = *userDir
+	} else if raw, readErr := os.ReadFile(editor.ConfigPath()); readErr == nil {
+		if save, ok := mod.ConfigSaveDir(raw); ok {
+			inst.UserDir = save
+		}
+	}
+	archives := &backup.Store{
+		Dir:        dirBackup,
+		Keep:       *backupKeep,
+		KeyPath:    filepath.Join(dirData, "backup.hmac"),
+		JournalDir: dirData,
+	}
+	if err := archives.Recover(inst, mod); err != nil {
+		log.Printf("warning: restore journal: %v; restore is blocked until it is fixed", err)
+	}
+	holds, err := archives.StrayHolds(inst, mod)
+	if err != nil {
+		log.Printf("warning: restore journal: %v; restore is blocked until it is fixed", err)
+		holds = nil
+	}
+	for _, hold := range holds {
+		log.Printf("warning: unjournaled hold %s; restore is blocked until it is discarded", hold)
+	}
+	staging, serr := archives.StrayStaging(inst, mod)
+	if serr != nil && err == nil {
+		log.Printf("warning: restore journal: %v; restore is blocked until it is fixed", serr)
+		staging = nil
+	}
+	for _, path := range staging {
+		log.Printf("warning: unjournaled restore staging %s; discard-hold stays blocked until it is removed", path)
+	}
 	srv, err := api.New(api.Options{
 		Token:      token,
 		InstanceID: *instance,
-		Instance: core.Instance{
-			ID:                    *instance,
-			Dir:                   dir,
-			EnableConsoleCommands: *console,
-		},
+		Instance:   inst,
 		Module:     mod,
 		Editor:     editor,
 		UIPort:     *uiPort,
 		Logs:       logs,
 		Supervisor: sup,
 		Steam:      steam,
-		// Update stays 501 until a real backup hook exists.
-		Backup: nil,
+		Archives:   archives,
+		UserDir:    *userDir,
 	})
 	if err != nil {
 		stderr.Fatal(err)

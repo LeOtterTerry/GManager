@@ -4,13 +4,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/LeOtterTerry/GManager/agent/internal/disk"
 )
 
 // diskFree reports bytes available to the caller on the volume holding path.
-// Platform files replace it. Tests replace it to simulate a full disk.
-var diskFree = func(string) (uint64, error) {
-	return 0, fmt.Errorf("free space is unavailable")
-}
+// Tests replace it to simulate a full disk. The default asks the disk package,
+// which has the Windows and Unix lookups.
+var diskFree = disk.Free
 
 func hasFreeSpace(path string, need uint64) error {
 	free, err := diskFree(existingDir(path))
