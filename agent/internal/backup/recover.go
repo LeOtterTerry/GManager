@@ -22,26 +22,38 @@ const (
 func (s *Store) Recover(inst core.Instance, mod core.GameModule) error {
 	allowed, err := allowedDests(inst, mod)
 	if err != nil {
-		if s.journalMissing() {
+		if s.journalMissing(inst.ID) {
 			return nil
 		}
 		return err
 	}
 	dir, err := s.journalDirectory()
 	if err != nil {
-		if s.journalMissing() {
+		if s.journalMissing(inst.ID) {
 			return nil
 		}
 		return err
 	}
 	key, err := s.readIntegrityKey()
 	if err != nil {
-		if s.journalMissing() {
+		if s.journalMissing(inst.ID) {
 			return nil
 		}
 		return err
 	}
-	return rollbackJournal(dir, key, allowed)
+	if s.journalMissing(inst.ID) {
+		return nil
+	}
+	if _, err := readJournal(dir, inst.ID, key); err != nil {
+		return err
+	}
+	expected, err := s.expectedRestore(inst.ID)
+	if err != nil {
+		return err
+	}
+	return rollbackJournal(dir, inst.ID, key, allowed, expected, func() error {
+		return s.rotateRestoreID(inst.ID)
+	})
 }
 
 // StrayHolds lists hold copies beside a save or config path that the
@@ -52,7 +64,7 @@ func (s *Store) StrayHolds(inst core.Instance, mod core.GameModule) ([]string, e
 		return nil, err
 	}
 	known := map[string]struct{}{}
-	if !s.journalMissing() {
+	if !s.journalMissing(inst.ID) {
 		dir, err := s.journalDirectory()
 		if err != nil {
 			return nil, err
@@ -61,8 +73,15 @@ func (s *Store) StrayHolds(inst core.Instance, mod core.GameModule) ([]string, e
 		if err != nil {
 			return nil, err
 		}
-		j, err := readJournal(dir, key)
+		j, err := readJournal(dir, inst.ID, key)
 		if err != nil {
+			return nil, err
+		}
+		expected, err := s.expectedRestore(inst.ID)
+		if err != nil {
+			return nil, err
+		}
+		if err := acceptJournal(j, inst.ID, expected); err != nil {
 			return nil, err
 		}
 		if err := validateJournal(j, allowed); err != nil {
@@ -123,7 +142,7 @@ func (s *Store) DiscardHold(inst core.Instance, mod core.GameModule, hold string
 	if info.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("%w: %s is a symlink", ErrJournal, hold)
 	}
-	if !s.journalMissing() {
+	if !s.journalMissing(inst.ID) {
 		dir, err := s.journalDirectory()
 		if err != nil {
 			return err
@@ -132,8 +151,15 @@ func (s *Store) DiscardHold(inst core.Instance, mod core.GameModule, hold string
 		if err != nil {
 			return err
 		}
-		j, err := readJournal(dir, key)
+		j, err := readJournal(dir, inst.ID, key)
 		if err != nil {
+			return err
+		}
+		expected, err := s.expectedRestore(inst.ID)
+		if err != nil {
+			return err
+		}
+		if err := acceptJournal(j, inst.ID, expected); err != nil {
 			return err
 		}
 		if err := validateJournal(j, allowed); err != nil {
@@ -158,12 +184,16 @@ func (s *Store) journalDirectory() (string, error) {
 	return s.JournalDir, nil
 }
 
-func (s *Store) journalMissing() bool {
+func (s *Store) journalMissing(instanceID string) bool {
 	dir, err := s.journalDirectory()
 	if err != nil {
 		return true
 	}
-	_, err = os.Lstat(journalPath(dir))
+	path, err := journalPath(dir, instanceID)
+	if err != nil {
+		return true
+	}
+	_, err = os.Lstat(path)
 	return errors.Is(err, os.ErrNotExist)
 }
 
@@ -171,8 +201,8 @@ func (s *Store) journalKey() ([]byte, error) {
 	return s.readIntegrityKey()
 }
 
-func (s *Store) committedJournal() (bool, error) {
-	if s.journalMissing() {
+func (s *Store) committedJournal(instanceID string) (bool, error) {
+	if s.journalMissing(instanceID) {
 		return false, nil
 	}
 	dir, err := s.journalDirectory()
@@ -183,11 +213,15 @@ func (s *Store) committedJournal() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return journalIsCommitted(dir, key)
+	expected, err := s.expectedRestore(instanceID)
+	if err != nil {
+		return false, err
+	}
+	return journalIsCommitted(dir, instanceID, key, expected)
 }
 
-func (s *Store) holdsRemain(allowed []string) (bool, error) {
-	if s.journalMissing() {
+func (s *Store) holdsRemain(instanceID string, allowed []string) (bool, error) {
+	if s.journalMissing(instanceID) {
 		return false, nil
 	}
 	dir, err := s.journalDirectory()
@@ -198,7 +232,11 @@ func (s *Store) holdsRemain(allowed []string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return journalHoldsExist(dir, key, allowed)
+	expected, err := s.expectedRestore(instanceID)
+	if err != nil {
+		return false, err
+	}
+	return journalHoldsExist(dir, instanceID, key, allowed, expected)
 }
 
 func allowedDests(inst core.Instance, mod core.GameModule) ([]string, error) {

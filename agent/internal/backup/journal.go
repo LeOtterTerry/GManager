@@ -46,22 +46,51 @@ var ErrHoldInUse = errors.New("hold is named by the restore journal")
 // and before its holds are deleted. Tests use it to fail cleanup.
 var hookCommitCleanup func() error
 
+// hookCommitReread, when set, runs after the committed journal is written
+// and before it is read back. Tests use it to fail revalidation.
+var hookCommitReread func() error
+
 type journalTarget struct {
-	Dest string `json:"dest"`
-	Hold string `json:"hold,omitempty"`
-	Dir  bool   `json:"dir"`
+	Dest    string `json:"dest"`
+	Hold    string `json:"hold,omitempty"`
+	Dir     bool   `json:"dir"`
+	Swapped bool   `json:"swapped,omitempty"`
 }
 
 type journalFile struct {
-	Version int             `json:"version"`
-	State   string          `json:"state"`
-	Targets []journalTarget `json:"targets"`
-	Staging []string        `json:"staging,omitempty"`
-	HMAC    string          `json:"hmac,omitempty"`
+	Version   int             `json:"version"`
+	State     string          `json:"state"`
+	Instance  string          `json:"instance"`
+	RestoreID string          `json:"restoreID"`
+	Targets   []journalTarget `json:"targets"`
+	Staging   []string        `json:"staging,omitempty"`
+	HMAC      string          `json:"hmac,omitempty"`
 }
 
-func journalPath(dir string) string {
-	return filepath.Join(dir, journalName)
+// BlocksRestore reports journal failures that must not stop the process.
+// Startup logs them and refuses restore until the journal is resolved.
+func BlocksRestore(err error) bool {
+	return errors.Is(err, ErrJournalAuth) || errors.Is(err, ErrJournal) || errors.Is(err, ErrMissingHold)
+}
+
+func validInstanceID(id string) error {
+	if id == "" || len(id) > 64 {
+		return fmt.Errorf("%w: instance id", ErrJournal)
+	}
+	for i, c := range id {
+		ok := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || (i > 0 && (c == '_' || c == '-'))
+		if !ok {
+			return fmt.Errorf("%w: instance id", ErrJournal)
+		}
+	}
+	return nil
+}
+
+func journalPath(dir, instanceID string) (string, error) {
+	if err := validInstanceID(instanceID); err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, journalName+"-"+instanceID), nil
 }
 
 func assignHolds(st *stagedSet) error {
@@ -104,19 +133,19 @@ func holdFor(dest string) (string, error) {
 	return allocateHold(dest)
 }
 
-func journalFrom(st *stagedSet, state string) journalFile {
-	j := journalFile{Version: journalVersion, State: state}
+func journalFrom(st *stagedSet, state, instance, restoreID string) journalFile {
+	j := journalFile{Version: journalVersion, State: state, Instance: instance, RestoreID: restoreID}
 	if st == nil {
 		return j
 	}
 	for _, dir := range st.dirs {
-		j.Targets = append(j.Targets, journalTarget{Dest: dir.dest, Hold: dir.hold, Dir: true})
+		j.Targets = append(j.Targets, journalTarget{Dest: dir.dest, Hold: dir.hold, Dir: true, Swapped: dir.swapped})
 		if dir.tmp != "" {
 			j.Staging = append(j.Staging, dir.tmp)
 		}
 	}
 	for _, file := range st.files {
-		j.Targets = append(j.Targets, journalTarget{Dest: file.dest, Hold: file.hold, Dir: false})
+		j.Targets = append(j.Targets, journalTarget{Dest: file.dest, Hold: file.hold, Dir: false, Swapped: file.swapped})
 		if file.tmp != "" {
 			j.Staging = append(j.Staging, file.tmp)
 		}
@@ -163,9 +192,21 @@ func checkJournalMAC(j journalFile, key []byte) error {
 	return nil
 }
 
-func writeJournal(dir string, j journalFile, key []byte) error {
+func writeJournal(dir, instanceID string, j journalFile, key []byte) error {
 	if dir == "" {
 		return errors.New("restore journal directory is not set")
+	}
+	if err := validInstanceID(instanceID); err != nil {
+		return err
+	}
+	if j.Instance == "" {
+		j.Instance = instanceID
+	}
+	if j.Instance != instanceID {
+		return fmt.Errorf("%w: journal instance does not match", ErrJournal)
+	}
+	if j.RestoreID == "" {
+		return fmt.Errorf("%w: restore id is missing", ErrJournal)
 	}
 	sealed, err := sealJournal(j, key)
 	if err != nil {
@@ -179,11 +220,19 @@ func writeJournal(dir string, j journalFile, key []byte) error {
 		return err
 	}
 	raw = append(raw, '\n')
-	path := journalPath(dir)
+	path, err := journalPath(dir, instanceID)
+	if err != nil {
+		return err
+	}
 	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
+	}
+	if rerr := owner.Restrict(tmp); rerr != nil {
+		cerr := f.Close()
+		removeErr := os.Remove(tmp)
+		return errors.Join(rerr, cerr, removeErr)
 	}
 	_, werr := f.Write(raw)
 	serr := f.Sync()
@@ -209,8 +258,11 @@ func writeJournal(dir string, j journalFile, key []byte) error {
 	return syncDir(dir)
 }
 
-func readJournal(dir string, key []byte) (j journalFile, err error) {
-	path := journalPath(dir)
+func readJournal(dir, instanceID string, key []byte) (j journalFile, err error) {
+	path, err := journalPath(dir, instanceID)
+	if err != nil {
+		return journalFile{}, err
+	}
 	info, err := os.Lstat(path)
 	if err != nil {
 		return journalFile{}, err
@@ -243,11 +295,30 @@ func readJournal(dir string, key []byte) (j journalFile, err error) {
 	if err = checkJournalMAC(j, key); err != nil {
 		return journalFile{}, err
 	}
+	if j.Instance != instanceID {
+		return journalFile{}, fmt.Errorf("%w: journal instance does not match", ErrJournal)
+	}
+	if j.RestoreID == "" {
+		return journalFile{}, fmt.Errorf("%w: restore id is missing", ErrJournal)
+	}
 	return j, nil
 }
 
-func removeJournal(dir string) error {
-	path := journalPath(dir)
+func acceptJournal(j journalFile, instance, expectedRestore string) error {
+	if j.Instance != instance {
+		return fmt.Errorf("%w: journal instance does not match", ErrJournal)
+	}
+	if j.RestoreID == "" || expectedRestore == "" || !hmac.Equal([]byte(j.RestoreID), []byte(expectedRestore)) {
+		return fmt.Errorf("%w: restore id does not match", ErrJournal)
+	}
+	return nil
+}
+
+func removeJournal(dir, instanceID string) error {
+	path, err := journalPath(dir, instanceID)
+	if err != nil {
+		return err
+	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -259,12 +330,22 @@ func removeJournal(dir string) error {
 }
 
 // commitJournal fsyncs the committed record before any hold is deleted.
-func commitJournal(dir string, st *stagedSet, key []byte, allowed []string) error {
-	if err := writeJournal(dir, journalFrom(st, journalCommitted), key); err != nil {
+// beforeRemove runs after the holds are gone and before the journal file is
+// removed, so a replay of this journal no longer matches.
+func commitJournal(dir, instanceID string, st *stagedSet, key []byte, allowed []string, restoreID string, beforeRemove func() error) error {
+	if err := writeJournal(dir, instanceID, journalFrom(st, journalCommitted, instanceID, restoreID), key); err != nil {
 		return err
 	}
-	j, err := readJournal(dir, key)
+	if hookCommitReread != nil {
+		if err := hookCommitReread(); err != nil {
+			return err
+		}
+	}
+	j, err := readJournal(dir, instanceID, key)
 	if err != nil {
+		return err
+	}
+	if err := acceptJournal(j, instanceID, restoreID); err != nil {
 		return err
 	}
 	if j.State != journalCommitted {
@@ -278,26 +359,57 @@ func commitJournal(dir string, st *stagedSet, key []byte, allowed []string) erro
 			return err
 		}
 	}
+	var errs error
 	for _, target := range j.Targets {
 		if target.Hold == "" {
 			continue
 		}
 		if err := refuseSpecial(target.Hold); err != nil {
-			return err
+			errs = errors.Join(errs, err)
+			continue
 		}
 		if err := os.RemoveAll(target.Hold); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = errors.Join(errs, err)
+		}
+	}
+	if errs != nil {
+		return errs
+	}
+	if beforeRemove != nil {
+		if err := beforeRemove(); err != nil {
 			return err
 		}
 	}
-	return removeJournal(dir)
+	return removeJournal(dir, instanceID)
 }
 
-func journalHoldsExist(dir string, key []byte, allowed []string) (bool, error) {
-	j, err := readJournal(dir, key)
+func markSwapped(dir, instanceID string, key []byte, dest string) error {
+	j, err := readJournal(dir, instanceID, key)
+	if err != nil {
+		return err
+	}
+	found := false
+	for i := range j.Targets {
+		if SamePath(j.Targets[i].Dest, dest) {
+			j.Targets[i].Swapped = true
+			found = true
+		}
+	}
+	if !found {
+		return fmt.Errorf("%w: swapped dest %s is not in the journal", ErrJournal, dest)
+	}
+	return writeJournal(dir, instanceID, j, key)
+}
+
+func journalHoldsExist(dir, instanceID string, key []byte, allowed []string, expectedRestore string) (bool, error) {
+	j, err := readJournal(dir, instanceID, key)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
 	if err != nil {
+		return false, err
+	}
+	if err := acceptJournal(j, instanceID, expectedRestore); err != nil {
 		return false, err
 	}
 	if err := validateJournal(j, allowed); err != nil {
@@ -314,53 +426,79 @@ func journalHoldsExist(dir string, key []byte, allowed []string) (bool, error) {
 	return false, nil
 }
 
-func rollbackJournal(dir string, key []byte, allowed []string) error {
-	j, err := readJournal(dir, key)
+func rollbackJournal(dir, instanceID string, key []byte, allowed []string, expectedRestore string, beforeRemove func() error) error {
+	j, err := readJournal(dir, instanceID, key)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
+	if err := acceptJournal(j, instanceID, expectedRestore); err != nil {
+		return err
+	}
 	if err := validateJournal(j, allowed); err != nil {
 		return err
 	}
 	if j.State == journalCommitted {
+		var errs error
 		for _, target := range j.Targets {
 			if target.Hold == "" {
 				continue
 			}
 			if err := refuseSpecial(target.Hold); err != nil {
-				return err
+				errs = errors.Join(errs, err)
+				continue
 			}
 			if err := os.RemoveAll(target.Hold); err != nil && !errors.Is(err, os.ErrNotExist) {
+				errs = errors.Join(errs, err)
+			}
+		}
+		if errs != nil {
+			return errs
+		}
+		if beforeRemove != nil {
+			if err := beforeRemove(); err != nil {
 				return err
 			}
 		}
-		return removeJournal(dir)
+		return removeJournal(dir, instanceID)
 	}
+	var errs error
 	for i := len(j.Targets) - 1; i >= 0; i-- {
 		if err := restoreHold(j.Targets[i]); err != nil {
-			return err
+			errs = errors.Join(errs, err)
 		}
 	}
 	for _, path := range j.Staging {
 		if err := refuseSpecial(path); err != nil {
-			return err
+			errs = errors.Join(errs, err)
+			continue
 		}
 		if err := os.RemoveAll(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = errors.Join(errs, err)
+		}
+	}
+	if errs != nil {
+		return errs
+	}
+	if beforeRemove != nil {
+		if err := beforeRemove(); err != nil {
 			return err
 		}
 	}
-	return removeJournal(dir)
+	return removeJournal(dir, instanceID)
 }
 
-func journalIsCommitted(dir string, key []byte) (bool, error) {
-	j, err := readJournal(dir, key)
+func journalIsCommitted(dir, instanceID string, key []byte, expectedRestore string) (bool, error) {
+	j, err := readJournal(dir, instanceID, key)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
 	if err != nil {
+		return false, err
+	}
+	if err := acceptJournal(j, instanceID, expectedRestore); err != nil {
 		return false, err
 	}
 	return j.State == journalCommitted, nil
@@ -374,9 +512,11 @@ func restoreHold(target journalTarget) error {
 		if target.Dest == "" {
 			return nil
 		}
-		if _, err := os.Lstat(target.Dest); errors.Is(err, os.ErrNotExist) {
+		_, err := os.Lstat(target.Dest)
+		if errors.Is(err, os.ErrNotExist) {
 			return nil
-		} else if err != nil {
+		}
+		if err != nil {
 			return err
 		}
 		return os.RemoveAll(target.Dest)
@@ -384,9 +524,21 @@ func restoreHold(target journalTarget) error {
 	if err := refuseSpecial(target.Hold); err != nil {
 		return err
 	}
-	if _, err := os.Lstat(target.Hold); errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("%w: %s", ErrMissingHold, target.Hold)
-	} else if err != nil {
+	_, err := os.Lstat(target.Hold)
+	if errors.Is(err, os.ErrNotExist) {
+		_, derr := os.Lstat(target.Dest)
+		if errors.Is(derr, os.ErrNotExist) {
+			return fmt.Errorf("%w: %s", ErrMissingHold, target.Hold)
+		}
+		if derr != nil {
+			return derr
+		}
+		if target.Swapped {
+			return fmt.Errorf("%w: %s", ErrMissingHold, target.Hold)
+		}
+		return nil
+	}
+	if err != nil {
 		return err
 	}
 	return undoSwapped(target.Dest, target.Hold, true)
@@ -476,24 +628,66 @@ func refuseSpecial(path string) error {
 	if path == "" {
 		return nil
 	}
-	info, err := os.Lstat(path)
+	return componentsSafe(path)
+}
+
+// componentsSafe refuses a symlink or reparse point on any component of path.
+// A missing leaf is allowed once its existing parents have been checked. The
+// parent is opened no-follow so a symlink that replaces it is not used.
+func componentsSafe(path string) error {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	abs = filepath.Clean(abs)
+	var comps []string
+	cur := abs
+	for {
+		comps = append(comps, cur)
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+	for i := len(comps) - 1; i >= 0; i-- {
+		info, lerr := os.Lstat(comps[i])
+		if errors.Is(lerr, os.ErrNotExist) {
+			if i+1 < len(comps) {
+				return openParentNoFollow(comps[i+1])
+			}
+			return nil
+		}
+		if lerr != nil {
+			return lerr
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: %s is a symlink", ErrJournal, comps[i])
+		}
+		reparse, rerr := reparsePoint(comps[i])
+		if rerr != nil {
+			return rerr
+		}
+		if reparse {
+			return fmt.Errorf("%w: %s is a reparse point", ErrJournal, comps[i])
+		}
+	}
+	parent := filepath.Dir(abs)
+	if parent == abs {
+		return nil
+	}
+	return openParentNoFollow(parent)
+}
+
+func openParentNoFollow(parent string) error {
+	f, err := openNoFollow(parent)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("%w: %s is a symlink", ErrJournal, path)
-	}
-	reparse, err := reparsePoint(path)
-	if err != nil {
-		return err
-	}
-	if reparse {
-		return fmt.Errorf("%w: %s is a reparse point", ErrJournal, path)
-	}
-	return nil
+	return f.Close()
 }
 
 func unjournaledHolds(dir string, known map[string]struct{}) ([]string, error) {

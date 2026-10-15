@@ -114,8 +114,8 @@ func (s *Store) RestoreInto(ctx context.Context, id string, inst core.Instance, 
 	// fails and the holds are already gone. Holds named by a pending journal
 	// stay on disk so the next recovery can roll them back.
 	allowed := allowedFromPlan(plan)
-	if err := s.commit(staged, allowed); err != nil {
-		return s.finishCommit(err, staged, safety, safetyID, plan, allowed)
+	if err := s.commit(staged, allowed, inst.ID); err != nil {
+		return s.finishCommit(err, staged, safety, safetyID, plan, allowed, inst.ID)
 	}
 	return nil
 }
@@ -131,8 +131,8 @@ func (s *Store) blockStray(inst core.Instance, mod core.GameModule) error {
 	return fmt.Errorf("%w: %s", ErrUnjournaledHold, holds[0])
 }
 
-func (s *Store) finishCommit(err error, staged *stagedSet, safety *archive, safetyID string, plan restorePlan, allowed []string) error {
-	committed, cerr := s.committedJournal()
+func (s *Store) finishCommit(err error, staged *stagedSet, safety *archive, safetyID string, plan restorePlan, allowed []string, instanceID string) error {
+	committed, cerr := s.committedJournal(instanceID)
 	if cerr != nil {
 		return errors.Join(err, cerr)
 	}
@@ -148,19 +148,22 @@ func (s *Store) finishCommit(err error, staged *stagedSet, safety *archive, safe
 		if dirErr != nil {
 			return errors.Join(err, dirErr)
 		}
-		if rmErr := removeJournal(dir); rmErr != nil {
+		if rotErr := s.rotateRestoreID(instanceID); rotErr != nil {
+			return errors.Join(err, rotErr)
+		}
+		if rmErr := removeJournal(dir, instanceID); rmErr != nil {
 			return errors.Join(err, rmErr)
 		}
 		return err
 	}
-	remain, herr := s.holdsRemain(allowed)
+	remain, herr := s.holdsRemain(instanceID, allowed)
 	if herr != nil {
 		return errors.Join(err, undoErr, herr)
 	}
 	if remain || safety == nil || !staged.dirty {
 		return errors.Join(err, undoErr)
 	}
-	rbErr := s.apply(safety, plan)
+	rbErr := s.apply(safety, plan, instanceID)
 	if rbErr != nil {
 		return fmt.Errorf("%w; undo failed: %v; rollback from safety backup %s failed: %v", err, undoErr, safetyID, rbErr)
 	}
@@ -392,7 +395,7 @@ func rewriteFile(path string, body []byte) error {
 	return cerr
 }
 
-func (s *Store) commit(st *stagedSet, allowed []string) error {
+func (s *Store) commit(st *stagedSet, allowed []string, instanceID string) error {
 	dir, err := s.journalDirectory()
 	if err != nil {
 		return err
@@ -401,23 +404,32 @@ func (s *Store) commit(st *stagedSet, allowed []string) error {
 	if err != nil {
 		return err
 	}
+	restoreID, err := newRestoreID()
+	if err != nil {
+		return err
+	}
+	if err := s.armRestore(instanceID, restoreID); err != nil {
+		return err
+	}
 	if err := assignHolds(st); err != nil {
 		return err
 	}
-	pending := journalFrom(st, journalPending)
+	pending := journalFrom(st, journalPending, instanceID, restoreID)
 	if err := validateJournal(pending, allowed); err != nil {
 		return err
 	}
-	if err := writeJournal(dir, pending, key); err != nil {
+	if err := writeJournal(dir, instanceID, pending, key); err != nil {
 		return err
 	}
-	if err := s.swapAll(st); err != nil {
+	if err := s.swapAll(st, dir, instanceID, key); err != nil {
 		return err
 	}
-	return commitJournal(dir, st, key, allowed)
+	return commitJournal(dir, instanceID, st, key, allowed, restoreID, func() error {
+		return s.rotateRestoreID(instanceID)
+	})
 }
 
-func (s *Store) swapAll(st *stagedSet) error {
+func (s *Store) swapAll(st *stagedSet, dir, instanceID string, key []byte) error {
 	for i := range st.dirs {
 		if err := s.beforeSwap(); err != nil {
 			return err
@@ -434,6 +446,9 @@ func (s *Store) swapAll(st *stagedSet) error {
 		}
 		st.dirs[i].swapped = true
 		st.dirty = true
+		if err := markSwapped(dir, instanceID, key, st.dirs[i].dest); err != nil {
+			return err
+		}
 	}
 	for i := range st.files {
 		if err := s.beforeSwap(); err != nil {
@@ -451,6 +466,9 @@ func (s *Store) swapAll(st *stagedSet) error {
 		}
 		st.files[i].swapped = true
 		st.dirty = true
+		if err := markSwapped(dir, instanceID, key, st.files[i].dest); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -462,7 +480,7 @@ func (s *Store) beforeSwap() error {
 	return s.swapFail()
 }
 
-func (s *Store) apply(a *archive, plan restorePlan) error {
+func (s *Store) apply(a *archive, plan restorePlan, instanceID string) error {
 	prev := s.swapFail
 	s.swapFail = nil
 	defer func() { s.swapFail = prev }()
@@ -473,8 +491,8 @@ func (s *Store) apply(a *archive, plan restorePlan) error {
 		}
 		return err
 	}
-	if err := s.commit(staged, allowedFromPlan(plan)); err != nil {
-		return s.finishCommit(err, staged, nil, "", plan, allowedFromPlan(plan))
+	if err := s.commit(staged, allowedFromPlan(plan), instanceID); err != nil {
+		return s.finishCommit(err, staged, nil, "", plan, allowedFromPlan(plan), instanceID)
 	}
 	return nil
 }

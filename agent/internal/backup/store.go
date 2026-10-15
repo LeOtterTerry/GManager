@@ -9,7 +9,11 @@ package backup
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -127,12 +131,15 @@ type Store struct {
 	// gone, calls fail with ErrKeyMissing instead of minting a key that would
 	// reject them.
 	KeyPath string
-	// JournalDir is the agent data directory. The restore journal is an
-	// owner-only HMAC file there, not in the server directory.
+	// JournalDir is the agent data directory. Each instance has an owner-only
+	// HMAC journal there, named .gmanager-restore-journal-<instance>, not in
+	// the server directory.
 	JournalDir string
 
-	keyMu     sync.Mutex
-	loadedKey []byte
+	keyMu          sync.Mutex
+	loadedKey      []byte
+	activeInstance string
+	activeRestore  string
 	// mu guards quarantine, discard, release, sign, and prune.
 	mu sync.Mutex
 	// swapFail, when set, runs before each live swap during restore.
@@ -989,6 +996,9 @@ func (s *Store) integrityKey() ([]byte, error) {
 			return nil, err
 		}
 	}
+	if err := s.ensureKeyMeta(found); err != nil {
+		return nil, err
+	}
 	s.loadedKey = append([]byte(nil), found...)
 	return append([]byte(nil), found...), nil
 }
@@ -1127,6 +1137,209 @@ func writeKeyFile(path string, b []byte) error {
 		return serr
 	}
 	return cerr
+}
+
+type keyMeta struct {
+	Created   time.Time `json:"created"`
+	Instance  string    `json:"instance,omitempty"`
+	RestoreID string    `json:"restoreID,omitempty"`
+	HMAC      string    `json:"hmac,omitempty"`
+}
+
+func (s *Store) metaPath() string {
+	if s == nil || s.KeyPath == "" {
+		return ""
+	}
+	return s.KeyPath + ".meta"
+}
+
+func metaMAC(meta keyMeta, key []byte) (string, error) {
+	if len(key) < 32 {
+		return "", errors.New("backup integrity key is not configured")
+	}
+	meta.HMAC = ""
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		return "", err
+	}
+	m := hmac.New(sha256.New, key)
+	if _, err := m.Write(raw); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(m.Sum(nil)), nil
+}
+
+func (s *Store) loadKeyMeta() (keyMeta, error) {
+	key, err := s.readIntegrityKey()
+	if err != nil {
+		return keyMeta{}, err
+	}
+	return s.readKeyMeta(key)
+}
+
+func (s *Store) readKeyMeta(key []byte) (keyMeta, error) {
+	path := s.metaPath()
+	if path == "" {
+		return keyMeta{}, os.ErrNotExist
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return keyMeta{}, err
+	}
+	var meta keyMeta
+	if err := json.Unmarshal(b, &meta); err != nil {
+		return keyMeta{}, fmt.Errorf("%w: key metadata", ErrJournalAuth)
+	}
+	sum, err := metaMAC(meta, key)
+	if err != nil {
+		return keyMeta{}, err
+	}
+	if meta.HMAC == "" || !hmac.Equal([]byte(sum), []byte(meta.HMAC)) {
+		return keyMeta{}, fmt.Errorf("%w: key metadata failed verification", ErrJournalAuth)
+	}
+	return meta, nil
+}
+
+func (s *Store) writeKeyMeta(meta keyMeta, key []byte) error {
+	path := s.metaPath()
+	if path == "" {
+		return nil
+	}
+	sum, err := metaMAC(meta, key)
+	if err != nil {
+		return err
+	}
+	meta.HMAC = sum
+	raw, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return err
+	}
+	raw = append(raw, '\n')
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if rerr := owner.Restrict(tmp); rerr != nil {
+		cerr := f.Close()
+		removeErr := os.Remove(tmp)
+		return errors.Join(rerr, cerr, removeErr)
+	}
+	_, werr := f.Write(raw)
+	serr := f.Sync()
+	cerr := f.Close()
+	if werr != nil {
+		removeErr := os.Remove(tmp)
+		return errors.Join(werr, removeErr)
+	}
+	if serr != nil {
+		return serr
+	}
+	if cerr != nil {
+		return cerr
+	}
+	if err := renameRetry(tmp, path); err != nil {
+		return err
+	}
+	if err := owner.Restrict(path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
+}
+
+func (s *Store) ensureKeyMeta(key []byte) error {
+	if s.metaPath() == "" {
+		return nil
+	}
+	if _, err := s.readKeyMeta(key); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	created := time.Now().UTC()
+	if earliest, err := s.earliestKeyMtime(); err == nil && !earliest.IsZero() {
+		created = earliest.UTC()
+	}
+	return s.writeKeyMeta(keyMeta{Created: created}, key)
+}
+
+func newRestoreID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+func (s *Store) armRestore(instance, restoreID string) error {
+	if err := validInstanceID(instance); err != nil {
+		return err
+	}
+	if restoreID == "" {
+		return fmt.Errorf("%w: restore id is missing", ErrJournal)
+	}
+	if s.KeyPath != "" {
+		key, err := s.readIntegrityKey()
+		if err != nil {
+			return err
+		}
+		meta, err := s.readKeyMeta(key)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			if err := s.ensureKeyMeta(key); err != nil {
+				return err
+			}
+			meta, err = s.readKeyMeta(key)
+			if err != nil {
+				return err
+			}
+		}
+		meta.Instance = instance
+		meta.RestoreID = restoreID
+		if err := s.writeKeyMeta(meta, key); err != nil {
+			return err
+		}
+	}
+	s.keyMu.Lock()
+	s.activeInstance = instance
+	s.activeRestore = restoreID
+	s.keyMu.Unlock()
+	return nil
+}
+
+func (s *Store) rotateRestoreID(instance string) error {
+	id, err := newRestoreID()
+	if err != nil {
+		return err
+	}
+	return s.armRestore(instance, id)
+}
+
+func (s *Store) expectedRestore(instance string) (string, error) {
+	if s.KeyPath != "" {
+		meta, err := s.loadKeyMeta()
+		if errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("%w: restore id does not match", ErrJournal)
+		}
+		if err != nil {
+			return "", err
+		}
+		if meta.Instance != instance || meta.RestoreID == "" {
+			return "", fmt.Errorf("%w: restore id does not match", ErrJournal)
+		}
+		return meta.RestoreID, nil
+	}
+	s.keyMu.Lock()
+	defer s.keyMu.Unlock()
+	if s.activeInstance != instance || s.activeRestore == "" {
+		return "", fmt.Errorf("%w: restore id does not match", ErrJournal)
+	}
+	return s.activeRestore, nil
 }
 
 type quarFile struct {
@@ -1293,7 +1506,7 @@ func (s *Store) previewSignLocked(id string) (SignView, error) {
 	if err != nil {
 		return SignView{}, err
 	}
-	key, err := s.integrityKey()
+	key, err := s.readIntegrityKey()
 	if err != nil {
 		return SignView{}, err
 	}
@@ -1356,6 +1569,23 @@ func (s *Store) refuseNewerThanKey(id string) error {
 }
 
 func (s *Store) keyCreated() (time.Time, error) {
+	if s == nil || s.KeyPath == "" {
+		return time.Time{}, errors.New("backup integrity key file is required to sign")
+	}
+	meta, err := s.loadKeyMeta()
+	if err != nil {
+		if errors.Is(err, ErrJournalAuth) {
+			return time.Time{}, fmt.Errorf("%w: key metadata failed verification", ErrIntegrity)
+		}
+		return time.Time{}, err
+	}
+	if meta.Created.IsZero() {
+		return time.Time{}, errors.New("backup integrity key creation time is missing")
+	}
+	return meta.Created, nil
+}
+
+func (s *Store) earliestKeyMtime() (time.Time, error) {
 	var earliest time.Time
 	found := false
 	for _, path := range s.keyPaths() {
@@ -1372,7 +1602,7 @@ func (s *Store) keyCreated() (time.Time, error) {
 		}
 	}
 	if !found {
-		return time.Time{}, errors.New("backup integrity key file is required to sign")
+		return time.Time{}, os.ErrNotExist
 	}
 	return earliest, nil
 }
