@@ -72,6 +72,10 @@ var (
 	ErrLiveBackup = errors.New("a live backup with that id already exists")
 	// ErrAmbiguousQuarantine means more than one quarantine file matches the id.
 	ErrAmbiguousQuarantine = errors.New("more than one quarantined copy")
+	// ErrTooNew means an unsigned zip is newer than the integrity key file.
+	ErrTooNew = errors.New("backup is newer than the integrity key")
+	// ErrManifestAck means sign was not given the manifest digest that was shown.
+	ErrManifestAck = errors.New("manifest acknowledgement does not match")
 )
 
 // Entry is one backup as the list API returns it.
@@ -123,6 +127,9 @@ type Store struct {
 	// gone, calls fail with ErrKeyMissing instead of minting a key that would
 	// reject them.
 	KeyPath string
+	// JournalDir is the agent data directory. The restore journal is an
+	// owner-only HMAC file there, not in the server directory.
+	JournalDir string
 
 	keyMu     sync.Mutex
 	loadedKey []byte
@@ -1217,22 +1224,157 @@ func (s *Store) quarantine(id string) error {
 	return errors.New("could not quarantine backup")
 }
 
-// Sign rewrites a hash-valid archive that has an empty HMAC. The caller has
-// to ask for it. A wrong HMAC is not signed. Listing and restore do not call
-// this.
-func (s *Store) Sign(id string) error {
+// SignView is the manifest an operator has to see before Sign will run.
+type SignView struct {
+	ID             string     `json:"id"`
+	Manifest       Manifest   `json:"manifest"`
+	Files          []SignFile `json:"files"`
+	ManifestSHA256 string     `json:"manifestSHA256"`
+	Unsigned       bool       `json:"unsigned"`
+	ZipModified    time.Time  `json:"zipModified"`
+	KeyCreated     time.Time  `json:"keyCreated,omitempty"`
+}
+
+// SignFile is one archived path and its sha256, shown before signing.
+type SignFile struct {
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
+}
+
+// PreviewSign reads an archive and returns its manifest and file hashes.
+// It does not rewrite the zip.
+func (s *Store) PreviewSign(id string) (SignView, error) {
+	if s == nil || s.Dir == "" {
+		return SignView{}, errors.New("backup directory is not configured")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.previewSignLocked(id)
+}
+
+// Sign rewrites a hash-valid archive that has an empty HMAC. manifestSHA256
+// is the digest PreviewSign showed. A zip newer than the key file is refused.
+// A wrong HMAC is not signed. Listing and restore do not call this.
+func (s *Store) Sign(id, manifestSHA256 string) error {
 	if s == nil || s.Dir == "" {
 		return errors.New("backup directory is not configured")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !validID(id) {
-		return ErrInvalidID
+	view, err := s.previewSignLocked(id)
+	if err != nil {
+		return err
 	}
-	if err := s.Exists(id); err != nil {
+	if manifestSHA256 == "" || !strings.EqualFold(manifestSHA256, view.ManifestSHA256) {
+		return ErrManifestAck
+	}
+	if !view.Unsigned {
+		return nil
+	}
+	if err := s.refuseNewerThanKey(id); err != nil {
 		return err
 	}
 	return s.signLocked(id)
+}
+
+func (s *Store) previewSignLocked(id string) (SignView, error) {
+	if !validID(id) {
+		return SignView{}, ErrInvalidID
+	}
+	path, err := s.zipPath(id)
+	if err != nil {
+		return SignView{}, err
+	}
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return SignView{}, ErrNotFound
+	}
+	if err != nil {
+		return SignView{}, err
+	}
+	key, err := s.integrityKey()
+	if err != nil {
+		return SignView{}, err
+	}
+	a, err := openArchive(path, openOpts{hash: true, mac: true, key: key})
+	if err != nil {
+		return SignView{}, err
+	}
+	man := a.man
+	unsigned := a.unsigned
+	if err := a.Close(); err != nil {
+		return SignView{}, err
+	}
+	if man.ID != id {
+		return SignView{}, fmt.Errorf("%w: manifest id does not match the file name", ErrIntegrity)
+	}
+	digest, err := manifestDigest(man)
+	if err != nil {
+		return SignView{}, err
+	}
+	view := SignView{
+		ID:             id,
+		Manifest:       man,
+		ManifestSHA256: digest,
+		Unsigned:       unsigned,
+		ZipModified:    info.ModTime().UTC(),
+	}
+	for _, f := range man.Files {
+		view.Files = append(view.Files, SignFile{Path: f.Path, SHA256: f.SHA256, Size: f.Size})
+	}
+	if view.Files == nil {
+		view.Files = []SignFile{}
+	}
+	if unsigned {
+		created, err := s.keyCreated()
+		if err != nil {
+			return SignView{}, err
+		}
+		view.KeyCreated = created.UTC()
+	}
+	return view, nil
+}
+
+func (s *Store) refuseNewerThanKey(id string) error {
+	path, err := s.zipPath(id)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	created, err := s.keyCreated()
+	if err != nil {
+		return err
+	}
+	if info.ModTime().After(created) {
+		return ErrTooNew
+	}
+	return nil
+}
+
+func (s *Store) keyCreated() (time.Time, error) {
+	var earliest time.Time
+	found := false
+	for _, path := range s.keyPaths() {
+		info, err := os.Stat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return time.Time{}, err
+		}
+		if !found || info.ModTime().Before(earliest) {
+			earliest = info.ModTime()
+			found = true
+		}
+	}
+	if !found {
+		return time.Time{}, errors.New("backup integrity key file is required to sign")
+	}
+	return earliest, nil
 }
 
 // Release renames one quarantined archive back to a live zip.

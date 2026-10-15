@@ -111,38 +111,46 @@ func main() {
 	if err := backup.ValidateDir(dirBackup, dir); err != nil {
 		stderr.Fatal(err)
 	}
-	recoverPaths := []string{dir, filepath.Join(dir, plainsofpain.ConfigRelPath)}
-	if *userDir != "" {
-		recoverPaths = append(recoverPaths, *userDir)
+	inst := core.Instance{
+		ID:                    *instance,
+		Dir:                   dir,
+		EnableConsoleCommands: *console,
 	}
-	if raw, readErr := os.ReadFile(editor.ConfigPath()); readErr == nil {
+	if *userDir != "" {
+		inst.UserDir = *userDir
+	} else if raw, readErr := os.ReadFile(editor.ConfigPath()); readErr == nil {
 		if save, ok := mod.ConfigSaveDir(raw); ok {
-			recoverPaths = append(recoverPaths, save)
+			inst.UserDir = save
 		}
 	}
-	if err := backup.Recover(recoverPaths...); err != nil {
+	archives := &backup.Store{
+		Dir:        dirBackup,
+		Keep:       *backupKeep,
+		KeyPath:    filepath.Join(dirData, "backup.hmac"),
+		JournalDir: dirData,
+	}
+	if err := archives.Recover(inst, mod); err != nil {
 		stderr.Fatal(err)
+	}
+	holds, err := archives.StrayHolds(inst, mod)
+	if err != nil {
+		stderr.Fatal(err)
+	}
+	for _, hold := range holds {
+		log.Printf("warning: unjournaled hold %s; restore is blocked until it is discarded", hold)
 	}
 	srv, err := api.New(api.Options{
 		Token:      token,
 		InstanceID: *instance,
-		Instance: core.Instance{
-			ID:                    *instance,
-			Dir:                   dir,
-			EnableConsoleCommands: *console,
-		},
+		Instance:   inst,
 		Module:     mod,
 		Editor:     editor,
 		UIPort:     *uiPort,
 		Logs:       logs,
 		Supervisor: sup,
 		Steam:      steam,
-		Archives: &backup.Store{
-			Dir:     dirBackup,
-			Keep:    *backupKeep,
-			KeyPath: filepath.Join(dirData, "backup.hmac"),
-		},
-		UserDir: *userDir,
+		Archives:   archives,
+		UserDir:    *userDir,
 	})
 	if err != nil {
 		stderr.Fatal(err)

@@ -85,7 +85,10 @@ func (s *Store) RestoreInto(ctx context.Context, id string, inst core.Instance, 
 			}
 		}()
 	}
-	if err := recoverInstance(inst, mod); err != nil {
+	if err := s.Recover(inst, mod); err != nil {
+		return err
+	}
+	if err := s.blockStray(inst, mod); err != nil {
 		return err
 	}
 	plan, err := prepare(ctx, a, inst, mod, s.Dir, s.ensureSpace)
@@ -110,31 +113,58 @@ func (s *Store) RestoreInto(ctx context.Context, id string, inst core.Instance, 
 	// from their holds. The safety zip is used only when that rename-back
 	// fails and the holds are already gone. Holds named by a pending journal
 	// stay on disk so the next recovery can roll them back.
-	journalDir := inst.Dir
-	if err := s.commit(staged, journalDir); err != nil {
-		if journalIsCommitted(journalDir) {
-			return err
-		}
-		undoErr := staged.undo()
-		if discardErr := staged.discard(); discardErr != nil {
-			undoErr = errors.Join(undoErr, discardErr)
-		}
-		if undoErr == nil {
-			if rmErr := removeJournal(journalDir); rmErr != nil {
-				return errors.Join(err, rmErr)
-			}
-			return err
-		}
-		if journalHoldsExist(journalDir) || safety == nil || !staged.dirty {
-			return errors.Join(err, undoErr)
-		}
-		rbErr := s.apply(safety, plan, journalDir)
-		if rbErr != nil {
-			return fmt.Errorf("%w; undo failed: %v; rollback from safety backup %s failed: %v", err, undoErr, safetyID, rbErr)
-		}
-		return fmt.Errorf("%w; rolled back from safety backup %s", err, safetyID)
+	allowed := allowedFromPlan(plan)
+	if err := s.commit(staged, allowed); err != nil {
+		return s.finishCommit(err, staged, safety, safetyID, plan, allowed)
 	}
 	return nil
+}
+
+func (s *Store) blockStray(inst core.Instance, mod core.GameModule) error {
+	holds, err := s.StrayHolds(inst, mod)
+	if err != nil {
+		return err
+	}
+	if len(holds) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrUnjournaledHold, holds[0])
+}
+
+func (s *Store) finishCommit(err error, staged *stagedSet, safety *archive, safetyID string, plan restorePlan, allowed []string) error {
+	committed, cerr := s.committedJournal()
+	if cerr != nil {
+		return errors.Join(err, cerr)
+	}
+	if committed {
+		return fmt.Errorf("restored; cleanup failed: %w", err)
+	}
+	undoErr := staged.undo()
+	if discardErr := staged.discard(); discardErr != nil {
+		undoErr = errors.Join(undoErr, discardErr)
+	}
+	if undoErr == nil {
+		dir, dirErr := s.journalDirectory()
+		if dirErr != nil {
+			return errors.Join(err, dirErr)
+		}
+		if rmErr := removeJournal(dir); rmErr != nil {
+			return errors.Join(err, rmErr)
+		}
+		return err
+	}
+	remain, herr := s.holdsRemain(allowed)
+	if herr != nil {
+		return errors.Join(err, undoErr, herr)
+	}
+	if remain || safety == nil || !staged.dirty {
+		return errors.Join(err, undoErr)
+	}
+	rbErr := s.apply(safety, plan)
+	if rbErr != nil {
+		return fmt.Errorf("%w; undo failed: %v; rollback from safety backup %s failed: %v", err, undoErr, safetyID, rbErr)
+	}
+	return fmt.Errorf("%w; rolled back from safety backup %s", err, safetyID)
 }
 
 type restorePlan struct {
@@ -362,17 +392,29 @@ func rewriteFile(path string, body []byte) error {
 	return cerr
 }
 
-func (s *Store) commit(st *stagedSet, journalDir string) error {
+func (s *Store) commit(st *stagedSet, allowed []string) error {
+	dir, err := s.journalDirectory()
+	if err != nil {
+		return err
+	}
+	key, err := s.integrityKey()
+	if err != nil {
+		return err
+	}
 	if err := assignHolds(st); err != nil {
 		return err
 	}
-	if err := writeJournal(journalDir, journalFrom(st, journalPending)); err != nil {
+	pending := journalFrom(st, journalPending)
+	if err := validateJournal(pending, allowed); err != nil {
+		return err
+	}
+	if err := writeJournal(dir, pending, key); err != nil {
 		return err
 	}
 	if err := s.swapAll(st); err != nil {
 		return err
 	}
-	return commitJournal(journalDir, st)
+	return commitJournal(dir, st, key, allowed)
 }
 
 func (s *Store) swapAll(st *stagedSet) error {
@@ -420,7 +462,7 @@ func (s *Store) beforeSwap() error {
 	return s.swapFail()
 }
 
-func (s *Store) apply(a *archive, plan restorePlan, journalDir string) error {
+func (s *Store) apply(a *archive, plan restorePlan) error {
 	prev := s.swapFail
 	s.swapFail = nil
 	defer func() { s.swapFail = prev }()
@@ -431,21 +473,8 @@ func (s *Store) apply(a *archive, plan restorePlan, journalDir string) error {
 		}
 		return err
 	}
-	if err := s.commit(staged, journalDir); err != nil {
-		if journalIsCommitted(journalDir) {
-			return err
-		}
-		undoErr := staged.undo()
-		if discardErr := staged.discard(); discardErr != nil {
-			undoErr = errors.Join(undoErr, discardErr)
-		}
-		if undoErr == nil {
-			if rmErr := removeJournal(journalDir); rmErr != nil {
-				return errors.Join(err, rmErr)
-			}
-			return err
-		}
-		return errors.Join(err, undoErr)
+	if err := s.commit(staged, allowedFromPlan(plan)); err != nil {
+		return s.finishCommit(err, staged, nil, "", plan, allowedFromPlan(plan))
 	}
 	return nil
 }

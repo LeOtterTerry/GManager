@@ -44,7 +44,7 @@ func TestWindowsBackupRestoreLongPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeSave(t, save, "world.dat", "round-trip")
-	store := &Store{Dir: filepath.Join(base, "backups"), Keep: 2, Key: testKey()}
+	store := &Store{Dir: filepath.Join(base, "backups"), JournalDir: filepath.Join(base, "journal"), Keep: 2, Key: testKey()}
 	inst := core.Instance{ID: "default", Dir: instDir, UserDir: save}
 	mod := plainsofpain.New()
 	entry, err := store.Create(context.Background(), Request{Instance: inst, Module: mod, Kind: KindManual})
@@ -63,7 +63,7 @@ func TestWindowsBackupRestoreLongPath(t *testing.T) {
 func TestWindowsRestoreLockedSaveFile(t *testing.T) {
 	inst, mod, save := newWorld(t)
 	writeSave(t, save, "world.dat", "alpha")
-	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), Keep: 2, Key: testKey()}
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), JournalDir: t.TempDir(), Keep: 2, Key: testKey()}
 	entry, err := store.Create(context.Background(), Request{Instance: inst, Module: mod, Kind: KindManual})
 	if err != nil {
 		t.Fatal(err)

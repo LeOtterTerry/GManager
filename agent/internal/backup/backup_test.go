@@ -51,9 +51,10 @@ func TestRoundTripRetentionAndCursor(t *testing.T) {
 	writeSave(t, save, "notes/empty.dat", "")
 	clock := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
 	store := &Store{
-		Dir:  filepath.Join(t.TempDir(), "backups"),
-		Keep: 10,
-		Key:  testKey(),
+		Dir:        filepath.Join(t.TempDir(), "backups"),
+		JournalDir: t.TempDir(),
+		Keep:       10,
+		Key:        testKey(),
 		Now: func() time.Time {
 			clock = clock.Add(time.Millisecond)
 			return clock
@@ -411,7 +412,7 @@ func TestPayloadAndManifestTamper(t *testing.T) {
 func TestFailedSwapRollsBackFromSafety(t *testing.T) {
 	inst, mod, save := newWorld(t)
 	writeSave(t, save, "world.dat", "alpha")
-	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), Keep: 5, Key: testKey()}
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), JournalDir: t.TempDir(), Keep: 5, Key: testKey()}
 	ctx := context.Background()
 	old, err := store.Create(ctx, Request{Instance: inst, Module: mod, Kind: KindManual})
 	if err != nil {
@@ -469,7 +470,7 @@ func TestFailedSwapRollsBackFromSafety(t *testing.T) {
 func TestFailedSwapUndoesBeforeSafetyZip(t *testing.T) {
 	inst, mod, save := newWorld(t)
 	writeSave(t, save, "world.dat", "alpha")
-	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), Keep: 5, Key: testKey()}
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), JournalDir: t.TempDir(), Keep: 5, Key: testKey()}
 	ctx := context.Background()
 	old, err := store.Create(ctx, Request{Instance: inst, Module: mod, Kind: KindManual})
 	if err != nil {
@@ -518,7 +519,7 @@ func TestFailedSwapUndoesBeforeSafetyZip(t *testing.T) {
 func TestCancelDuringSwapStillRestores(t *testing.T) {
 	inst, mod, save := newWorld(t)
 	writeSave(t, save, "world.dat", "alpha")
-	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), Keep: 5, Key: testKey()}
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), JournalDir: t.TempDir(), Keep: 5, Key: testKey()}
 	entry, err := store.Create(context.Background(), Request{Instance: inst, Module: mod, Kind: KindManual})
 	if err != nil {
 		t.Fatal(err)
@@ -663,7 +664,22 @@ func TestMissingKeyDoesNotMintOrDelete(t *testing.T) {
 func TestUnsignedBackupIsSignedInPlace(t *testing.T) {
 	inst, mod, save := newWorld(t)
 	writeSave(t, save, "world.dat", "alpha")
-	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), Keep: 5, Key: testKey()}
+	data := t.TempDir()
+	keyPath := filepath.Join(data, "backup.hmac")
+	if err := os.WriteFile(keyPath, testKey(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	keyWhen := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(keyPath, keyWhen, keyWhen); err != nil {
+		t.Fatal(err)
+	}
+	store := &Store{
+		Dir:        filepath.Join(t.TempDir(), "backups"),
+		JournalDir: data,
+		Keep:       5,
+		Key:        testKey(),
+		KeyPath:    keyPath,
+	}
 	ctx := context.Background()
 	entry, err := store.Create(ctx, Request{Instance: inst, Module: mod, Kind: KindManual})
 	if err != nil {
@@ -710,7 +726,35 @@ func TestUnsignedBackupIsSignedInPlace(t *testing.T) {
 	if got := readSave(t, save, "world.dat"); got != "live" {
 		t.Fatalf("world = %q", got)
 	}
-	if err := store.Sign(entry.ID); err != nil {
+	view, err := store.PreviewSign(entry.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !view.Unsigned || view.ManifestSHA256 == "" || len(view.Files) == 0 || view.Files[0].SHA256 == "" {
+		t.Fatalf("preview = %+v", view)
+	}
+	unsigned, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Sign(entry.ID, view.ManifestSHA256); !errors.Is(err, ErrTooNew) {
+		t.Fatalf("newer than key = %v", err)
+	}
+	stayed, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(unsigned, stayed) {
+		t.Fatal("a zip newer than the key was rewritten")
+	}
+	older := keyWhen.Add(-time.Hour)
+	if err := os.Chtimes(path, older, older); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Sign(entry.ID, "not-the-manifest"); !errors.Is(err, ErrManifestAck) {
+		t.Fatalf("ack = %v", err)
+	}
+	if err := store.Sign(entry.ID, view.ManifestSHA256); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Contains(manifestJSON(t, path), []byte(`"hmac"`)) {
@@ -735,7 +779,7 @@ func TestUnsignedBackupIsSignedInPlace(t *testing.T) {
 	if err := os.Chtimes(path, time.Now().Add(2*time.Second), time.Now().Add(2*time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Sign(entry.ID); !errors.Is(err, ErrIntegrity) {
+	if err := store.Sign(entry.ID, view.ManifestSHA256); !errors.Is(err, ErrIntegrity) {
 		t.Fatalf("sign bad hash = %v", err)
 	}
 	if err := store.Verify(entry.ID); !errors.Is(err, ErrIntegrity) {
@@ -812,55 +856,62 @@ func TestInventoryCacheSkipsUnchangedZips(t *testing.T) {
 	}
 }
 
-func TestJournalRollsBackPendingAndReportsUnjournaledHolds(t *testing.T) {
-	root := t.TempDir()
-	dest := filepath.Join(root, "saves")
-	if err := os.MkdirAll(dest, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dest, "world.dat"), []byte("new"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	hold := filepath.Join(root, ".gmanager-hold-saves")
+func TestJournalRollsBackPendingAndLeavesStrayHolds(t *testing.T) {
+	inst, mod, save := newWorld(t)
+	writeSave(t, save, "world.dat", "new")
+	parent := filepath.Dir(save)
+	hold := filepath.Join(parent, ".gmanager-hold-"+filepath.Base(save))
 	if err := os.MkdirAll(hold, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(hold, "world.dat"), []byte("old"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	staging := filepath.Join(root, ".gmanager-restore-abc")
+	staging := filepath.Join(parent, ".gmanager-restore-abc")
 	if err := os.MkdirAll(staging, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	stray := filepath.Join(root, ".gmanager-migrate-abc")
+	stray := filepath.Join(parent, ".gmanager-migrate-abc")
 	if err := os.MkdirAll(stray, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	pending := journalFile{
 		Version: journalVersion,
 		State:   journalPending,
-		Targets: []journalTarget{{Dest: dest, Hold: hold, Dir: true}},
+		Targets: []journalTarget{{Dest: save, Hold: hold, Dir: true}},
 		Staging: []string{staging},
 	}
-	if err := writeJournal(root, pending); err != nil {
+	if err := writeRawJournal(t, inst.Dir, pending); err != nil {
 		t.Fatal(err)
 	}
-	if err := Recover(dest); err != nil {
+	data := t.TempDir()
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), JournalDir: data, Keep: 5, Key: testKey()}
+	if err := store.Recover(inst, mod); err != nil {
 		t.Fatal(err)
 	}
-	if got := readSave(t, dest, "world.dat"); got != "new" {
-		t.Fatalf("child scan changed the save: %q", got)
+	if got := readSave(t, save, "world.dat"); got != "new" {
+		t.Fatalf("server-dir journal changed the save: %q", got)
+	}
+	if _, err := os.Stat(journalPath(inst.Dir)); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := os.Stat(hold); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(journalPath(root)); err != nil {
+	if err := writeJournal(data, pending, testKey()); err != nil {
 		t.Fatal(err)
 	}
-	if err := Recover(root); err != nil {
+	info, err := os.Stat(journalPath(data))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if got := readSave(t, dest, "world.dat"); got != "old" {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+		t.Fatalf("journal mode = %o", info.Mode().Perm())
+	}
+	if err := store.Recover(inst, mod); err != nil {
+		t.Fatal(err)
+	}
+	if got := readSave(t, save, "world.dat"); got != "old" {
 		t.Fatalf("world = %q", got)
 	}
 	if _, err := os.Stat(hold); !errors.Is(err, os.ErrNotExist) {
@@ -872,14 +923,12 @@ func TestJournalRollsBackPendingAndReportsUnjournaledHolds(t *testing.T) {
 	if _, err := os.Stat(stray); err != nil {
 		t.Fatal("unlisted staging was removed")
 	}
-	if _, err := os.Stat(journalPath(root)); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(journalPath(data)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("journal was kept")
 	}
 
-	if err := os.WriteFile(filepath.Join(dest, "world.dat"), []byte("new"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	extra := filepath.Join(root, ".gmanager-hold-saves.2")
+	writeSave(t, save, "world.dat", "new")
+	extra := hold + ".2"
 	if err := os.MkdirAll(extra, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -889,35 +938,345 @@ func TestJournalRollsBackPendingAndReportsUnjournaledHolds(t *testing.T) {
 	committed := journalFile{
 		Version: journalVersion,
 		State:   journalCommitted,
-		Targets: []journalTarget{{Dest: dest, Hold: extra, Dir: true}},
+		Targets: []journalTarget{{Dest: save, Hold: extra, Dir: true}},
 	}
-	if err := writeJournal(root, committed); err != nil {
+	if err := writeJournal(data, committed, testKey()); err != nil {
 		t.Fatal(err)
 	}
-	if err := Recover(root); err != nil {
+	if err := store.Recover(inst, mod); err != nil {
 		t.Fatal(err)
 	}
-	if got := readSave(t, dest, "world.dat"); got != "new" {
+	if got := readSave(t, save, "world.dat"); got != "new" {
 		t.Fatalf("committed world = %q", got)
 	}
 	if _, err := os.Stat(extra); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("committed hold was kept")
 	}
 
-	orphan := filepath.Join(root, ".gmanager-hold-saves")
+	orphan := hold
 	if err := os.MkdirAll(orphan, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(orphan, "world.dat"), []byte("only-copy"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	err := Recover(root)
-	if !errors.Is(err, ErrUnjournaledHold) {
-		t.Fatalf("unjournaled = %v", err)
+	if err := store.Recover(inst, mod); err != nil {
+		t.Fatalf("stray hold stopped recovery: %v", err)
+	}
+	found, err := store.StrayHolds(inst, mod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(found) != 1 || !SamePath(found[0], orphan) {
+		t.Fatalf("stray = %v", found)
 	}
 	if _, err := os.Stat(orphan); err != nil {
 		t.Fatal("unjournaled hold was deleted")
 	}
+}
+
+func TestForgedJournalIsNotApplied(t *testing.T) {
+	inst, mod, save := newWorld(t)
+	writeSave(t, save, "world.dat", "live")
+	victim := filepath.Join(t.TempDir(), "victim.dat")
+	if err := os.WriteFile(victim, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	data := t.TempDir()
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), JournalDir: data, Keep: 5, Key: testKey()}
+	forged := journalFile{
+		Version: journalVersion,
+		State:   journalCommitted,
+		Targets: []journalTarget{{Dest: save, Hold: victim, Dir: false}},
+		HMAC:    "0000000000000000000000000000000000000000000000000000000000000000",
+	}
+	if err := writeRawJournal(t, data, forged); err != nil {
+		t.Fatal(err)
+	}
+	err := store.Recover(inst, mod)
+	if !errors.Is(err, ErrJournalAuth) {
+		t.Fatalf("forged = %v", err)
+	}
+	if got := readSave(t, save, "world.dat"); got != "live" {
+		t.Fatalf("world = %q", got)
+	}
+	if got, err := os.ReadFile(victim); err != nil || string(got) != "keep" {
+		t.Fatalf("victim = %q %v", got, err)
+	}
+	if _, err := os.Stat(journalPath(data)); err != nil {
+		t.Fatal("forged journal was removed")
+	}
+
+	secret := filepath.Join(t.TempDir(), "secret.dat")
+	if err := os.WriteFile(secret, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(journalPath(data)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, journalPath(data)); err != nil {
+		t.Logf("symlink journal not tested: %v", err)
+		return
+	}
+	err = store.Recover(inst, mod)
+	if err == nil || !errors.Is(err, ErrJournal) {
+		t.Fatalf("symlink journal = %v", err)
+	}
+	if got, err := os.ReadFile(secret); err != nil || string(got) != "secret" {
+		t.Fatalf("secret = %q %v", got, err)
+	}
+}
+
+func TestPathTraversalJournalIsNotApplied(t *testing.T) {
+	inst, mod, save := newWorld(t)
+	writeSave(t, save, "world.dat", "live")
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim.dat")
+	if err := os.WriteFile(victim, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Dir(save)
+	hold := filepath.Join(parent, ".gmanager-hold-"+filepath.Base(save))
+	if err := os.MkdirAll(hold, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hold, "world.dat"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	data := t.TempDir()
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), JournalDir: data, Keep: 5, Key: testKey()}
+	cases := []journalFile{
+		{
+			Version: journalVersion,
+			State:   journalPending,
+			Targets: []journalTarget{{Dest: victim, Dir: false}},
+		},
+		{
+			Version: journalVersion,
+			State:   journalPending,
+			Targets: []journalTarget{{Dest: save, Hold: victim, Dir: true}},
+		},
+		{
+			Version: journalVersion,
+			State:   journalPending,
+			Targets: []journalTarget{{Dest: save, Hold: hold, Dir: true}},
+			Staging: []string{victim},
+		},
+		{
+			Version: journalVersion,
+			State:   journalPending,
+			Targets: []journalTarget{{Dest: save, Hold: filepath.Join(outside, ".gmanager-hold-"+filepath.Base(save)), Dir: true}},
+		},
+	}
+	for i, pending := range cases {
+		if err := writeJournal(data, pending, testKey()); err != nil {
+			t.Fatal(err)
+		}
+		err := store.Recover(inst, mod)
+		if !errors.Is(err, ErrJournal) {
+			t.Fatalf("case %d = %v", i, err)
+		}
+		if got := readSave(t, save, "world.dat"); got != "live" {
+			t.Fatalf("case %d world = %q", i, got)
+		}
+		if got, err := os.ReadFile(victim); err != nil || string(got) != "keep" {
+			t.Fatalf("case %d victim = %q %v", i, got, err)
+		}
+		if _, err := os.Stat(hold); err != nil {
+			t.Fatalf("case %d hold: %v", i, err)
+		}
+		if _, err := os.Stat(journalPath(data)); err != nil {
+			t.Fatalf("case %d journal removed: %v", i, err)
+		}
+	}
+
+	target := filepath.Join(t.TempDir(), "link-target")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "world.dat"), []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(save); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, save); err != nil {
+		t.Logf("symlink dest not tested: %v", err)
+		return
+	}
+	linked := journalFile{
+		Version: journalVersion,
+		State:   journalPending,
+		Targets: []journalTarget{{Dest: save, Hold: hold, Dir: true}},
+	}
+	if err := writeJournal(data, linked, testKey()); err != nil {
+		t.Fatal(err)
+	}
+	err := store.Recover(inst, mod)
+	if err == nil || !errors.Is(err, ErrJournal) {
+		t.Fatalf("symlink dest = %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(target, "world.dat")); err != nil || string(got) != "secret" {
+		t.Fatalf("link target = %q %v", got, err)
+	}
+}
+
+func TestMissingHoldIsReported(t *testing.T) {
+	inst, mod, save := newWorld(t)
+	writeSave(t, save, "world.dat", "live")
+	hold := filepath.Join(filepath.Dir(save), ".gmanager-hold-"+filepath.Base(save))
+	data := t.TempDir()
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), JournalDir: data, Keep: 5, Key: testKey()}
+	pending := journalFile{
+		Version: journalVersion,
+		State:   journalPending,
+		Targets: []journalTarget{{Dest: save, Hold: hold, Dir: true}},
+	}
+	if err := writeJournal(data, pending, testKey()); err != nil {
+		t.Fatal(err)
+	}
+	err := store.Recover(inst, mod)
+	if !errors.Is(err, ErrMissingHold) {
+		t.Fatalf("missing hold = %v", err)
+	}
+	if got := readSave(t, save, "world.dat"); got != "live" {
+		t.Fatalf("world = %q", got)
+	}
+	if _, err := os.Stat(journalPath(data)); err != nil {
+		t.Fatal("journal was removed")
+	}
+}
+
+func TestStrayHoldBlocksRestoreAndDiscardHold(t *testing.T) {
+	inst, mod, save := newWorld(t)
+	writeSave(t, save, "world.dat", "alpha")
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), JournalDir: t.TempDir(), Keep: 5, Key: testKey()}
+	ctx := context.Background()
+	entry, err := store.Create(ctx, Request{Instance: inst, Module: mod, Kind: KindManual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSave(t, save, "world.dat", "live")
+	parent := filepath.Dir(save)
+	hold := filepath.Join(parent, ".gmanager-hold-"+filepath.Base(save))
+	if err := os.MkdirAll(hold, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hold, "world.dat"), []byte("only-copy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(parent, ".gmanager-hold-other")
+	if err := os.MkdirAll(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Recover(inst, mod); err != nil {
+		t.Fatal(err)
+	}
+	found, err := store.StrayHolds(inst, mod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(found) != 1 || !SamePath(found[0], hold) {
+		t.Fatalf("stray = %v", found)
+	}
+	if err := store.Restore(ctx, entry.ID, inst, mod); !errors.Is(err, ErrUnjournaledHold) {
+		t.Fatalf("restore = %v", err)
+	}
+	if got := readSave(t, save, "world.dat"); got != "live" {
+		t.Fatalf("world = %q", got)
+	}
+	victim := filepath.Join(t.TempDir(), "victim.dat")
+	if err := os.WriteFile(victim, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DiscardHold(inst, mod, victim); !errors.Is(err, ErrInvalidHold) {
+		t.Fatalf("victim discard = %v", err)
+	}
+	if got, err := os.ReadFile(victim); err != nil || string(got) != "keep" {
+		t.Fatalf("victim = %q %v", got, err)
+	}
+	linkHold := hold + ".2"
+	if err := os.Symlink(victim, linkHold); err != nil {
+		t.Logf("symlink hold not tested: %v", err)
+	} else {
+		if err := store.DiscardHold(inst, mod, linkHold); !errors.Is(err, ErrJournal) {
+			t.Fatalf("symlink discard = %v", err)
+		}
+		if got, err := os.ReadFile(victim); err != nil || string(got) != "keep" {
+			t.Fatalf("symlink victim = %q %v", got, err)
+		}
+		if _, err := os.Lstat(linkHold); err != nil {
+			t.Fatal("symlink hold was removed")
+		}
+		if err := os.Remove(linkHold); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.DiscardHold(inst, mod, hold); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(hold); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("hold was kept")
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Fatal("unrelated hold name was removed")
+	}
+	if err := store.Restore(ctx, entry.ID, inst, mod); err != nil {
+		t.Fatal(err)
+	}
+	if got := readSave(t, save, "world.dat"); got != "alpha" {
+		t.Fatalf("world = %q", got)
+	}
+
+	if err := os.MkdirAll(hold, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	named := journalFile{
+		Version: journalVersion,
+		State:   journalPending,
+		Targets: []journalTarget{{Dest: save, Hold: hold, Dir: true}},
+	}
+	if err := writeJournal(store.JournalDir, named, testKey()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DiscardHold(inst, mod, hold); !errors.Is(err, ErrHoldInUse) {
+		t.Fatalf("in use = %v", err)
+	}
+	if _, err := os.Stat(hold); err != nil {
+		t.Fatal("journaled hold was deleted")
+	}
+}
+
+func TestCommitCleanupFailure(t *testing.T) {
+	inst, mod, save := newWorld(t)
+	writeSave(t, save, "world.dat", "alpha")
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), JournalDir: t.TempDir(), Keep: 5, Key: testKey()}
+	entry, err := store.Create(context.Background(), Request{Instance: inst, Module: mod, Kind: KindManual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSave(t, save, "world.dat", "live")
+	hookCommitCleanup = func() error { return errors.New("disk full") }
+	t.Cleanup(func() { hookCommitCleanup = nil })
+	err = store.Restore(context.Background(), entry.ID, inst, mod)
+	if err == nil || !strings.Contains(err.Error(), "restored; cleanup failed") {
+		t.Fatalf("err = %v", err)
+	}
+	if got := readSave(t, save, "world.dat"); got != "alpha" {
+		t.Fatalf("world = %q", got)
+	}
+}
+
+func writeRawJournal(t *testing.T, dir string, j journalFile) error {
+	t.Helper()
+	raw, err := json.Marshal(j)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(journalPath(dir), append(raw, '\n'), 0o600)
 }
 
 func TestCaseCollidingZipEntries(t *testing.T) {
@@ -978,19 +1337,29 @@ func TestAdaptConfigRefusesBeforeSwap(t *testing.T) {
 func TestPendingJournalIsWrittenBeforeSwap(t *testing.T) {
 	inst, mod, save := newWorld(t)
 	writeSave(t, save, "world.dat", "alpha")
-	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), Keep: 5, Key: testKey()}
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), JournalDir: t.TempDir(), Keep: 5, Key: testKey()}
 	entry, err := store.Create(context.Background(), Request{Instance: inst, Module: mod, Kind: KindManual})
 	if err != nil {
 		t.Fatal(err)
 	}
 	writeSave(t, save, "world.dat", "live")
 	store.swapFail = func() error {
-		j, err := readJournal(inst.Dir)
+		j, err := readJournal(store.JournalDir, testKey())
 		if err != nil {
 			return err
 		}
-		if j.State != journalPending || len(j.Targets) == 0 {
+		if j.State != journalPending || len(j.Targets) == 0 || j.HMAC == "" {
 			return errors.New("journal was not pending before the swap")
+		}
+		info, err := os.Lstat(journalPath(store.JournalDir))
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("journal is a symlink")
+		}
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+			return errors.New("journal mode is not 0600")
 		}
 		return errors.New("stop before swap")
 	}
@@ -1001,8 +1370,11 @@ func TestPendingJournalIsWrittenBeforeSwap(t *testing.T) {
 	if got := readSave(t, save, "world.dat"); got != "live" {
 		t.Fatalf("world = %q", got)
 	}
-	if _, err := os.Stat(journalPath(inst.Dir)); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(journalPath(store.JournalDir)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("journal left behind: %v", err)
+	}
+	if _, err := os.Stat(journalPath(inst.Dir)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("journal was written into the server directory")
 	}
 }
 

@@ -387,6 +387,16 @@ func macManifest(man Manifest, key []byte) (string, error) {
 	return hex.EncodeToString(m.Sum(nil)), nil
 }
 
+func manifestDigest(man Manifest) (string, error) {
+	man.HMAC = ""
+	raw, err := json.Marshal(man)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
+}
+
 func checkManifestMAC(man Manifest, key []byte) error {
 	if man.HMAC == "" {
 		// Version 1 archives written before the key existed have no hmac.

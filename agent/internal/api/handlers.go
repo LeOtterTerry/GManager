@@ -245,13 +245,124 @@ func (s *Server) postDiscardBackup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) postSignBackup(w http.ResponseWriter, r *http.Request) {
-	s.postArchiveConfirm(w, r, "sign", "sign requires confirm=true", "sign requires a backup id", func(id string) error {
-		return s.archives.Sign(id)
-	}, func(err error) decision {
-		if errors.Is(err, backup.ErrIntegrity) {
-			return decision{Status: http.StatusConflict, Body: errorBody{Error: "integrity", Message: "backup failed integrity check"}}
+	if !s.knownInstance(w, r) {
+		return
+	}
+	body, err := readBody(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: "invalid_body", Message: bodyReadMessage(err)})
+		return
+	}
+	s.accept(w, r, body, func() decision {
+		ok, err := confirmed(body)
+		if err != nil {
+			return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "invalid_body", Message: "body must be JSON"}}
 		}
-		return decision{}
+		id, err := backupID(body)
+		if err != nil {
+			return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "backup_id_required", Message: "sign requires a backup id"}}
+		}
+		if s.archives == nil {
+			return decision{Status: http.StatusNotImplemented, Body: errorBody{
+				Error:   "not_implemented",
+				Message: "backup directory is not configured",
+			}}
+		}
+		if !ok {
+			view, err := s.archives.PreviewSign(id)
+			if err != nil {
+				return signDecision(err)
+			}
+			return decision{Status: http.StatusOK, Body: map[string]any{
+				"action":         "sign-preview",
+				"id":             view.ID,
+				"manifest":       view.Manifest,
+				"files":          view.Files,
+				"manifestSHA256": view.ManifestSHA256,
+				"unsigned":       view.Unsigned,
+				"zipModified":    view.ZipModified,
+				"keyCreated":     view.KeyCreated,
+			}}
+		}
+		digest, err := manifestAck(body)
+		if err != nil {
+			return decision{Status: http.StatusBadRequest, Body: errorBody{
+				Error:   "manifest_required",
+				Message: "sign requires the manifest SHA-256 from the preview",
+			}}
+		}
+		if err := s.archives.Sign(id, digest); err != nil {
+			return signDecision(err)
+		}
+		return decision{Status: http.StatusOK, Body: map[string]any{"action": "sign", "id": id}}
+	})
+}
+
+func signDecision(err error) decision {
+	if errors.Is(err, backup.ErrInvalidID) {
+		return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "invalid_backup_id", Message: "invalid backup id"}}
+	}
+	if errors.Is(err, backup.ErrNotFound) {
+		return decision{Status: http.StatusNotFound, Body: errorBody{Error: "not_found", Message: "unknown backup"}}
+	}
+	if errors.Is(err, backup.ErrIntegrity) {
+		return decision{Status: http.StatusConflict, Body: errorBody{Error: "integrity", Message: "backup failed integrity check"}}
+	}
+	if errors.Is(err, backup.ErrManifestAck) {
+		return decision{Status: http.StatusConflict, Body: errorBody{Error: "manifest_mismatch", Message: "manifest acknowledgement does not match"}}
+	}
+	if errors.Is(err, backup.ErrTooNew) {
+		return decision{Status: http.StatusConflict, Body: errorBody{Error: "backup_newer_than_key", Message: "backup is newer than the integrity key"}}
+	}
+	return decision{Status: http.StatusInternalServerError, Body: errorBody{Error: "internal", Message: "could not sign backup"}}
+}
+
+func (s *Server) postDiscardHold(w http.ResponseWriter, r *http.Request) {
+	if !s.knownInstance(w, r) {
+		return
+	}
+	body, err := readBody(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: "invalid_body", Message: bodyReadMessage(err)})
+		return
+	}
+	s.accept(w, r, body, func() decision {
+		ok, err := confirmed(body)
+		if err != nil {
+			return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "invalid_body", Message: "body must be JSON"}}
+		}
+		if !ok {
+			return decision{Status: http.StatusBadRequest, Body: errorBody{
+				Error:   "confirm_required",
+				Message: "discard-hold requires confirm=true",
+			}}
+		}
+		hold, err := holdPathBody(body)
+		if err != nil {
+			return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "hold_required", Message: "discard-hold requires a hold path"}}
+		}
+		if s.archives == nil {
+			return decision{Status: http.StatusNotImplemented, Body: errorBody{
+				Error:   "not_implemented",
+				Message: "backup directory is not configured",
+			}}
+		}
+		if err := s.archives.DiscardHold(s.withSaveDir(s.inst), s.mod, hold); err != nil {
+			if errors.Is(err, backup.ErrInvalidHold) {
+				return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "invalid_hold", Message: "not a restore hold"}}
+			}
+			if errors.Is(err, backup.ErrNotFound) {
+				return decision{Status: http.StatusNotFound, Body: errorBody{Error: "not_found", Message: "unknown hold"}}
+			}
+			if errors.Is(err, backup.ErrHoldInUse) {
+				return decision{Status: http.StatusConflict, Body: errorBody{Error: "hold_in_use", Message: "hold is named by the restore journal"}}
+			}
+			if errors.Is(err, backup.ErrJournal) || errors.Is(err, backup.ErrJournalAuth) {
+				return decision{Status: http.StatusConflict, Body: errorBody{Error: "journal", Message: err.Error()}}
+			}
+			return decision{Status: http.StatusInternalServerError, Body: errorBody{Error: "internal", Message: "could not discard hold"}}
+		}
+		return decision{Status: http.StatusOK, Body: map[string]any{"action": "discard-hold", "path": hold}}
 	})
 }
 
@@ -677,6 +788,32 @@ func confirmArchivedSaveDir(body []byte) bool {
 		return false
 	}
 	return payload.ConfirmArchivedSaveDir
+}
+
+func manifestAck(body []byte) (string, error) {
+	var payload struct {
+		ManifestSHA256 string `json:"manifestSHA256"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(payload.ManifestSHA256) == "" {
+		return "", errors.New("missing")
+	}
+	return payload.ManifestSHA256, nil
+}
+
+func holdPathBody(body []byte) (string, error) {
+	var payload struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(payload.Path) == "" {
+		return "", errors.New("missing")
+	}
+	return payload.Path, nil
 }
 
 func backupID(body []byte) (string, error) {

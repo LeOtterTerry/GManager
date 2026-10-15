@@ -487,10 +487,30 @@ func TestSignAndRelease(t *testing.T) {
 	}
 	id, _ := succeededResult(t, httpSrv.URL, body)["id"].(string)
 	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/sign", "test-token", `{"id":"`+id+`"}`, nil)
-	if status != http.StatusBadRequest || !bytes.Contains(body, []byte("confirm_required")) {
-		t.Fatalf("sign confirm = %d %s", status, body)
+	if status != http.StatusOK || !bytes.Contains(body, []byte(`"action":"sign-preview"`)) || !bytes.Contains(body, []byte("manifestSHA256")) {
+		t.Fatalf("sign preview = %d %s", status, body)
+	}
+	var preview struct {
+		ManifestSHA256 string `json:"manifestSHA256"`
+		Files          []struct {
+			SHA256 string `json:"sha256"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(body, &preview); err != nil {
+		t.Fatal(err)
+	}
+	if preview.ManifestSHA256 == "" || len(preview.Files) == 0 || preview.Files[0].SHA256 == "" {
+		t.Fatalf("preview = %s", body)
 	}
 	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/sign", "test-token", `{"confirm":true,"id":"`+id+`"}`, nil)
+	if status != http.StatusBadRequest || !bytes.Contains(body, []byte("manifest_required")) {
+		t.Fatalf("sign confirm = %d %s", status, body)
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/sign", "test-token", `{"confirm":true,"id":"`+id+`","manifestSHA256":"deadbeef"}`, nil)
+	if status != http.StatusConflict || !bytes.Contains(body, []byte("manifest_mismatch")) {
+		t.Fatalf("sign mismatch = %d %s", status, body)
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/sign", "test-token", `{"confirm":true,"id":"`+id+`","manifestSHA256":"`+preview.ManifestSHA256+`"}`, nil)
 	if status != http.StatusOK || !bytes.Contains(body, []byte(`"action":"sign"`)) {
 		t.Fatalf("sign = %d %s", status, body)
 	}
@@ -507,6 +527,55 @@ func TestSignAndRelease(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(archives.Dir, id+".zip")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDiscardHoldAPI(t *testing.T) {
+	save := t.TempDir()
+	archives := testArchives(t, 5)
+	_, httpSrv, cfgPath := newAPIOpt(t, 50, Options{Archives: archives})
+	writeCfg(t, cfgPath, configJSON(t, save, "kept"))
+	hold := filepath.Join(filepath.Dir(save), ".gmanager-hold-"+filepath.Base(save))
+	if err := os.MkdirAll(hold, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hold, "world.dat"), []byte("only-copy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	noConfirm, err := json.Marshal(map[string]any{"path": hold})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, body, _ := do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/discard-hold", "test-token", string(noConfirm), nil)
+	if status != http.StatusBadRequest || !bytes.Contains(body, []byte("confirm_required")) {
+		t.Fatalf("confirm = %d %s", status, body)
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/discard-hold", "test-token", `{"confirm":true}`, nil)
+	if status != http.StatusBadRequest || !bytes.Contains(body, []byte("hold_required")) {
+		t.Fatalf("path = %d %s", status, body)
+	}
+	badPath, err := json.Marshal(map[string]any{"confirm": true, "path": save})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/discard-hold", "test-token", string(badPath), nil)
+	if status != http.StatusBadRequest || !bytes.Contains(body, []byte("invalid_hold")) {
+		t.Fatalf("invalid = %d %s", status, body)
+	}
+	raw, err := json.Marshal(map[string]any{"confirm": true, "path": hold})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/discard-hold", "test-token", string(raw), nil)
+	if status != http.StatusOK || !bytes.Contains(body, []byte(`"action":"discard-hold"`)) {
+		t.Fatalf("discard = %d %s", status, body)
+	}
+	if _, err := os.Stat(hold); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("hold err = %v", err)
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/discard-hold", "test-token", string(raw), nil)
+	if status != http.StatusNotFound {
+		t.Fatalf("missing = %d %s", status, body)
 	}
 }
 
@@ -670,7 +739,7 @@ func fakeBytes(t *testing.T) []byte {
 
 func testArchives(t *testing.T, keep int) *backup.Store {
 	t.Helper()
-	return &backup.Store{Dir: t.TempDir(), Keep: keep, Key: bytes.Repeat([]byte{3}, 32)}
+	return &backup.Store{Dir: t.TempDir(), JournalDir: t.TempDir(), Keep: keep, Key: bytes.Repeat([]byte{3}, 32)}
 }
 
 func flipZip(t *testing.T, path string) {
