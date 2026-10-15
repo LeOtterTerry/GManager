@@ -19,6 +19,20 @@ import (
 	"github.com/LeOtterTerry/GManager/agent/internal/fakepop"
 )
 
+func TestRunTimeoutDefaultsToAnHour(t *testing.T) {
+	if DefaultRunTimeout != 60*time.Minute {
+		t.Fatalf("default = %s", DefaultRunTimeout)
+	}
+	c := New(t.TempDir())
+	if c.runLimit() != DefaultRunTimeout {
+		t.Fatalf("limit = %s", c.runLimit())
+	}
+	c.Timeout = time.Minute
+	if c.runLimit() != time.Minute {
+		t.Fatalf("override = %s", c.runLimit())
+	}
+}
+
 func TestArgsAnonymousValidate(t *testing.T) {
 	got := Args(2227360, "/srv/pop", true)
 	want := []string{

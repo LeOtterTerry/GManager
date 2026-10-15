@@ -130,7 +130,7 @@ func (s *Supervisor) Update(ctx context.Context, updater AppUpdater, backup Back
 	s.mu.Unlock()
 
 	if err := backup(ctx, inst); err != nil {
-		return s.recoverPrevious(ctx, inst, mod, wasRunning, err)
+		return s.recoverPrevious(inst, mod, wasRunning, err)
 	}
 	s.mu.Lock()
 	s.updating = true
@@ -139,7 +139,7 @@ func (s *Supervisor) Update(ctx context.Context, updater AppUpdater, backup Back
 	preserve := preservedRel(mod, inst)
 	snap, err := snapshotTree(inst.Dir, preserve)
 	if err != nil {
-		return s.recoverPrevious(ctx, inst, mod, wasRunning, err)
+		return s.recoverPrevious(inst, mod, wasRunning, err)
 	}
 	defer func() {
 		if removeErr := os.RemoveAll(snap); removeErr != nil && s.log != nil {
@@ -147,25 +147,26 @@ func (s *Supervisor) Update(ctx context.Context, updater AppUpdater, backup Back
 		}
 	}()
 	if err := updater.AppUpdate(ctx, spec.AppID, inst.Dir, spec.Validate, spec.Anonymous, s.log); err != nil {
-		return s.rollback(ctx, snap, preserve, inst, mod, wasRunning, err)
+		return s.rollback(snap, preserve, inst, mod, wasRunning, err)
 	}
 	if err := s.start(ctx, inst, mod, true); err != nil {
-		return s.rollback(ctx, snap, preserve, inst, mod, wasRunning, err)
+		return s.rollback(snap, preserve, inst, mod, wasRunning, err)
 	}
 	return nil
 }
 
-func (s *Supervisor) recoverPrevious(ctx context.Context, inst core.Instance, mod core.GameModule, wasRunning bool, cause error) error {
+func (s *Supervisor) recoverPrevious(inst core.Instance, mod core.GameModule, wasRunning bool, cause error) error {
 	if !wasRunning {
 		return cause
 	}
-	if err := s.start(ctx, inst, mod, true); err != nil {
+	// The update context may already be cancelled. Restart must not inherit that.
+	if err := s.start(context.Background(), inst, mod, true); err != nil {
 		return fmt.Errorf("%w; restarting the previous build failed: %v", cause, err)
 	}
 	return cause
 }
 
-func (s *Supervisor) rollback(ctx context.Context, snap string, preserve map[string]struct{}, inst core.Instance, mod core.GameModule, wasRunning bool, cause error) error {
+func (s *Supervisor) rollback(snap string, preserve map[string]struct{}, inst core.Instance, mod core.GameModule, wasRunning bool, cause error) error {
 	s.mu.Lock()
 	alive := s.pid != 0
 	s.mu.Unlock()
@@ -192,7 +193,8 @@ func (s *Supervisor) rollback(ctx context.Context, snap string, preserve map[str
 		return fmt.Errorf("update failed: %v; restore failed: %w", cause, err)
 	}
 	if wasRunning {
-		if err := s.start(ctx, inst, mod, true); err != nil {
+		// A cancelled update must still be able to start the restored build.
+		if err := s.start(context.Background(), inst, mod, true); err != nil {
 			return fmt.Errorf("update failed: %v; previous build was restored but did not become ready: %w", cause, err)
 		}
 	}

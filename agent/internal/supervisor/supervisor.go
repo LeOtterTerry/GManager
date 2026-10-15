@@ -306,20 +306,32 @@ func (s *Supervisor) spawnLocked() (chan struct{}, error) {
 	cmd := exec.Command(resolved, s.mod.LaunchArgs(s.inst)...)
 	cmd.Dir = s.inst.Dir
 	cmd.WaitDelay = ioWaitDelay
-	stdout, err := cmd.StdoutPipe()
+	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
 		return nil, err
 	}
-	stderr, err := cmd.StderrPipe()
+	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
+		closeAll(stdoutR, stdoutW)
 		return nil, err
 	}
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
 	killFn, closeFn, err := startProcess(cmd)
 	if err != nil {
+		closeAll(stdoutR, stdoutW, stderrR, stderrW)
 		if s.state != StateUpdating {
 			s.state = StateCrashed
 		}
 		s.message = err.Error()
+		return nil, err
+	}
+	if err := stdoutW.Close(); err != nil {
+		abortUnwatched(cmd, killFn, closeFn, stdoutR, stderrW, stderrR)
+		return nil, err
+	}
+	if err := stderrW.Close(); err != nil {
+		abortUnwatched(cmd, killFn, closeFn, stdoutR, stderrR)
 		return nil, err
 	}
 	if s.closeFn != nil {
@@ -342,19 +354,92 @@ func (s *Supervisor) spawnLocked() (chan struct{}, error) {
 	release := make(chan struct{})
 	go func() {
 		<-release
-		s.watch(stdout, stderr, cmd, gen)
+		s.watch(stdoutR, stderrR, cmd, gen)
 	}()
 	return release, nil
 }
 
-func (s *Supervisor) watch(stdout, stderr io.Reader, cmd *exec.Cmd, gen int) {
-	go s.scan(stdout, gen)
-	go s.scan(stderr, gen)
+func (s *Supervisor) watch(stdout, stderr io.ReadCloser, cmd *exec.Cmd, gen int) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		s.scan(stdout, gen)
+	}()
+	go func() {
+		defer wg.Done()
+		s.scan(stderr, gen)
+	}()
 	done := make(chan error, 1)
 	go func() {
 		done <- cmd.Wait()
 	}()
-	s.onExit(gen, <-done)
+	err := <-done
+	// The process has exited. Read the remaining log before closing the
+	// pipes, so the last lines are not discarded with the unread buffer.
+	drainThenClose(&wg, stdout, stderr)
+	s.onExit(gen, err)
+}
+
+// closeJobHandle drops the Windows job handle without TerminateJobObject.
+// KILL_ON_JOB_CLOSE then ends the server and every process in the job.
+// Unix has no job handle, so this is a no-op there.
+func (s *Supervisor) closeJobHandle() error {
+	s.mu.Lock()
+	fn := s.closeFn
+	s.closeFn = nil
+	s.mu.Unlock()
+	if fn == nil {
+		return nil
+	}
+	return fn()
+}
+
+func drainThenClose(wg *sync.WaitGroup, pipes ...io.Closer) {
+	drained := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(ioWaitDelay):
+	}
+	closeAll(pipes...)
+	<-drained
+}
+
+func closeAll(closers ...io.Closer) {
+	for _, c := range closers {
+		if c == nil {
+			continue
+		}
+		if err := c.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			continue
+		}
+	}
+}
+
+func abortUnwatched(cmd *exec.Cmd, killFn, closeFn func() error, pipes ...io.Closer) {
+	var killErr, waitErr, closeErr error
+	if killFn != nil {
+		killErr = killFn()
+	}
+	if (killFn == nil || killErr != nil) && cmd != nil && cmd.Process != nil {
+		if err := cmd.Process.Kill(); err != nil {
+			killErr = err
+		}
+	}
+	if cmd != nil && cmd.Process != nil {
+		waitErr = cmd.Wait()
+	}
+	if closeFn != nil {
+		closeErr = closeFn()
+	}
+	closeAll(pipes...)
+	if killErr != nil || waitErr != nil || closeErr != nil {
+		return
+	}
 }
 
 func (s *Supervisor) scan(r io.Reader, gen int) {

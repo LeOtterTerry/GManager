@@ -12,12 +12,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "--grandchild" {
+		// Stay alive until the job is killed. Do not read fakeserver.json:
+		// that would spawn another child.
+		select {}
+	}
 	cfg := loadConfig()
 	out := bufio.NewWriter(os.Stdout)
 	say := func(line string) {
@@ -31,6 +37,11 @@ func main() {
 
 	say("Dedicated server boot")
 	say("Loading configs/server.json")
+	if cfg.Grandchild {
+		if err := spawnGrandchild(); err != nil {
+			exitf("grandchild: %v", err)
+		}
+	}
 	if cfg.ExitBeforeReady {
 		say("Set Game State: FAILED")
 		os.Exit(1)
@@ -84,6 +95,10 @@ type fileConfig struct {
 	HangAfterRuns   int    `json:"hangAfterRuns"`
 	IgnoreStop      bool   `json:"ignoreStop"`
 	ExitBeforeReady bool   `json:"exitBeforeReady"`
+	// Grandchild makes this process spawn a child that waits until it is
+	// killed. The child does not inherit the log pipes. Its pid is written
+	// to grandchild.pid in the working directory.
+	Grandchild bool `json:"grandchild"`
 }
 
 type config struct {
@@ -92,6 +107,7 @@ type config struct {
 	Hang            bool
 	IgnoreStop      bool
 	ExitBeforeReady bool
+	Grandchild      bool
 }
 
 func loadConfig() config {
@@ -121,6 +137,7 @@ func loadConfig() config {
 	cfg.Hang = file.Hang
 	cfg.IgnoreStop = file.IgnoreStop
 	cfg.ExitBeforeReady = file.ExitBeforeReady
+	cfg.Grandchild = file.Grandchild
 	if file.HangAfterRuns > 0 && nextRun() >= file.HangAfterRuns {
 		cfg.Hang = true
 	}
@@ -142,6 +159,22 @@ func nextRun() int {
 		exitf("run counter: %v", err)
 	}
 	return n
+}
+
+func spawnGrandchild() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(exe, "--grandchild")
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	pid := cmd.Process.Pid
+	if err := cmd.Process.Release(); err != nil {
+		return err
+	}
+	return os.WriteFile("grandchild.pid", []byte(strconv.Itoa(pid)+"\n"), 0o644)
 }
 
 func exitf(format string, args ...any) {

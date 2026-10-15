@@ -32,7 +32,7 @@ Writes return **202**:
 
 `state` is `queued`, `running`, `succeeded`, or `failed`. Unknown ids are **404**. Finished jobs are kept in memory for 15 minutes (`DefaultRetention`) and then dropped, which also returns **404**.
 
-`POST /api/v1/jobs/{id}/cancel` cancels a running job. Install and update pass that context to SteamCMD, so cancel stops the SteamCMD process. A SteamCMD run also stops on its own after 20 minutes. The response is **200** with the job, **404** when the id is unknown, and **409** `job_finished` when the job already succeeded or failed.
+`POST /api/v1/jobs/{id}/cancel` cancels a running job. Install and update pass that context to SteamCMD, so cancel stops the SteamCMD process. A SteamCMD run also stops on its own after `--steamcmd-timeout` (default 60 minutes). The response is **200** with the job, **404** when the id is unknown, and **409** `job_finished` when the job already succeeded or failed. Cancelling an update does not cancel the restart of the previous build.
 
 Config saves are decided before the response (so a conflict is a synchronous **409**, not a failed job). An accepted config save is recorded as a job that is already `succeeded`. Other accepted actions are real jobs.
 

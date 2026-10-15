@@ -52,7 +52,7 @@ Defaults:
 - revision metadata: `<data-dir>/state/default/server.json.meta`
 - token file, when generated: `<data-dir>/token`
 
-Flags: `--data-dir`, `--server-dir`, `--instance` (default `default`), `--ui-port` (default `5173`), `--stop-method` (empty, or `interrupt`), `--console-commands` (default false). An instance id starts with a letter or digit and may contain letters, digits, `_`, and `-`, up to 64 characters. The API accepts a browser `Origin` only on `--ui-port`.
+Flags: `--data-dir`, `--server-dir`, `--instance` (default `default`), `--ui-port` (default `5173`), `--stop-method` (empty, or `interrupt`), `--console-commands` (default false), `--steamcmd-timeout` (default `60m`). An instance id starts with a letter or digit and may contain letters, digits, `_`, and `-`, up to 64 characters. The API accepts a browser `Origin` only on `--ui-port`.
 
 `--stop-method` defaults to empty, which uses the module. Plains of Pain's clean stop is unknown, so stop kills the process. `interrupt` sends SIGTERM on Unix and is not a confirmed game stop. `--console-commands` adds `-cc`. Leave it off until that flag is confirmed. SteamCMD is stored under `<data-dir>/steamcmd`. Restart requires `confirm: true`. Update returns 501 until a backup hook exists; the agent does not invent one.
 

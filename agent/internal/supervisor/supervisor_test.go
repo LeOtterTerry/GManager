@@ -445,6 +445,56 @@ func TestRollbackChecksFreeSpace(t *testing.T) {
 	}
 }
 
+func TestCancelledUpdateRestartsPreviousBuild(t *testing.T) {
+	inst := newFake(t, `{"readyDelay":"20ms"}`)
+	sup := New(testPolicy(), nil)
+	t.Cleanup(func() { stopNow(t, sup) })
+	if err := sup.Start(context.Background(), inst, plainsofpain.New()); err != nil {
+		t.Fatal(err)
+	}
+	steam := &scriptedSteam{err: errors.New("should not run")}
+	ctx, cancel := context.WithCancel(context.Background())
+	err := sup.Update(ctx, steam, func(context.Context, core.Instance) error {
+		cancel()
+		return context.Canceled
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v", err)
+	}
+	if steam.calls != 0 {
+		t.Fatalf("steam calls = %d", steam.calls)
+	}
+	st := sup.Status()
+	if st.State != StateRunning || !st.Ready || st.PID == 0 {
+		t.Fatalf("previous build = %+v", st)
+	}
+}
+
+func TestCloseJobHandleWithoutAProcess(t *testing.T) {
+	sup := New(testPolicy(), nil)
+	if err := sup.closeJobHandle(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExitLineIsLogged(t *testing.T) {
+	inst := newFake(t, `{"exitBeforeReady":true}`)
+	pol := testPolicy()
+	pol.CrashLimit = 1
+	var lines []string
+	sup := New(pol, func(line string) {
+		lines = append(lines, line)
+	})
+	t.Cleanup(func() { stopNow(t, sup) })
+	err := sup.Start(context.Background(), inst, plainsofpain.New())
+	if err == nil {
+		t.Fatal("start succeeded")
+	}
+	if !strings.Contains(strings.Join(lines, "\n"), "Set Game State: FAILED") {
+		t.Fatalf("log = %q err = %v", lines, err)
+	}
+}
+
 func TestNilBackupFailsClosed(t *testing.T) {
 	inst := newFake(t, `{"readyDelay":"20ms"}`)
 	sup := New(testPolicy(), nil)

@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -27,8 +28,8 @@ const (
 	WindowsArchiveURL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip"
 	// MaxDownloadBytes is the largest installer body that will be written.
 	MaxDownloadBytes int64 = 64 << 20
-	// RunTimeout bounds a SteamCMD process when the caller does not cancel first.
-	RunTimeout = 20 * time.Minute
+	// DefaultRunTimeout bounds a SteamCMD install when Client.Timeout is unset.
+	DefaultRunTimeout = 60 * time.Minute
 	// ioWaitDelay bounds how long Wait blocks on pipes after the process exits.
 	ioWaitDelay = 5 * time.Second
 
@@ -48,6 +49,8 @@ type Client struct {
 	// which is WinVerifyTrust on Windows. Tests that plant a fake binary set
 	// this to a no-op.
 	Verify func(path string) error
+	// Timeout bounds one SteamCMD process. Zero uses DefaultRunTimeout.
+	Timeout time.Duration
 }
 
 // New returns a client that stores SteamCMD in dir.
@@ -194,33 +197,102 @@ func (c *Client) AppUpdate(ctx context.Context, appID int, installDir string, va
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	ctx, cancel := context.WithTimeout(ctx, RunTimeout)
+	ctx, cancel := context.WithTimeout(ctx, c.runLimit())
 	defer cancel()
 	exe, err := c.Ensure(ctx)
 	if err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, exe, Args(appID, installDir, validate)...)
-	cmd.Dir = c.Dir
+	return runLogged(ctx, exe, Args(appID, installDir, validate), c.Dir, log)
+}
+
+func (c *Client) runLimit() time.Duration {
+	if c.Timeout > 0 {
+		return c.Timeout
+	}
+	return DefaultRunTimeout
+}
+
+func runLogged(ctx context.Context, exe string, args []string, dir string, log func(string)) error {
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		closeAll(stdoutR, stdoutW)
+		return err
+	}
+	cmd := exec.CommandContext(ctx, exe, args...)
+	cmd.Dir = dir
 	cmd.WaitDelay = ioWaitDelay
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return err
-	}
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
 	if err := cmd.Start(); err != nil {
+		closeAll(stdoutR, stdoutW, stderrR, stderrW)
 		return err
 	}
-	go scanOutput(stdout, log)
-	go scanOutput(stderr, log)
+	if err := stdoutW.Close(); err != nil {
+		return stopLogged(cmd, err, stdoutR, stderrW, stderrR)
+	}
+	if err := stderrW.Close(); err != nil {
+		return stopLogged(cmd, err, stdoutR, stderrR)
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		scanOutput(stdoutR, log)
+	}()
+	go func() {
+		defer wg.Done()
+		scanOutput(stderrR, log)
+	}()
 	done := make(chan error, 1)
 	go func() {
 		done <- cmd.Wait()
 	}()
-	return <-done
+	waitErr := <-done
+	drainThenClose(&wg, stdoutR, stderrR)
+	return waitErr
+}
+
+func stopLogged(cmd *exec.Cmd, cause error, pipes ...io.Closer) error {
+	var killErr, waitErr error
+	if cmd.Process != nil {
+		killErr = cmd.Process.Kill()
+		waitErr = cmd.Wait()
+	}
+	closeAll(pipes...)
+	if killErr != nil || waitErr != nil {
+		return fmt.Errorf("%w (kill: %v, wait: %v)", cause, killErr, waitErr)
+	}
+	return cause
+}
+
+func drainThenClose(wg *sync.WaitGroup, pipes ...io.Closer) {
+	drained := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(ioWaitDelay):
+	}
+	closeAll(pipes...)
+	<-drained
+}
+
+func closeAll(closers ...io.Closer) {
+	for _, c := range closers {
+		if c == nil {
+			continue
+		}
+		if err := c.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			continue
+		}
+	}
 }
 
 func scanOutput(r io.Reader, log func(string)) {

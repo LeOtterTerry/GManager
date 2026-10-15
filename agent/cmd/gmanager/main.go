@@ -34,6 +34,7 @@ func main() {
 	uiPort := flag.Int("ui-port", api.DefaultUIPort, "dashboard origin port")
 	stopMethod := flag.String("stop-method", "", "stop override: empty uses the module; interrupt is SIGTERM on Unix and is not a confirmed Plains of Pain clean stop")
 	console := flag.Bool("console-commands", false, "pass -cc (UNVERIFIED on Windows; default false)")
+	steamTimeout := flag.Duration("steamcmd-timeout", steamcmd.DefaultRunTimeout, "maximum time for one SteamCMD install or update")
 	flag.Parse()
 
 	dirData := *dataDir
@@ -56,6 +57,9 @@ func main() {
 	apiPort, err := portFromAddr(*addr)
 	if err != nil {
 		stderr.Fatal(err)
+	}
+	if *steamTimeout <= 0 {
+		stderr.Fatal("steamcmd-timeout must be positive")
 	}
 	switch core.StopMethod(*stopMethod) {
 	case core.StopUnknown, core.StopInterrupt:
@@ -83,6 +87,7 @@ func main() {
 	})
 	sup.SetStopMethod(core.StopMethod(*stopMethod))
 	steam := steamcmd.New(filepath.Join(dirData, "steamcmd"))
+	steam.Timeout = *steamTimeout
 	srv, err := api.New(api.Options{
 		Token:      token,
 		InstanceID: *instance,

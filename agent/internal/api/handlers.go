@@ -213,7 +213,7 @@ func (s *Server) guardConfig(fn func() (any, error)) (any, error) {
 		return nil, hashErr
 	}
 	if before != after {
-		return nil, errors.New("config was rewritten on start")
+		return nil, errors.New("config was rewritten")
 	}
 	return result, err
 }
