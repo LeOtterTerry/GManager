@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -41,12 +42,21 @@ func TestResolveToken(t *testing.T) {
 	if len(generated) < MinTokenLength || strings.Contains(generated, " ") {
 		t.Fatalf("generated token length = %d", len(generated))
 	}
-	info, err := os.Stat(filepath.Join(dir, "token"))
+	path := filepath.Join(dir, "token")
+	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	// Windows reports 0666 for every file. The ACL is the permission that matters there.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("mode = %o", info.Mode().Perm())
+	}
+	open, err := tokenOpenToOthers(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if open {
+		t.Fatal("generated token file is readable by other users")
 	}
 	again, err := ResolveToken(dir)
 	if err != nil {
