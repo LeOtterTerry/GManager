@@ -91,6 +91,9 @@ func TestUserDirHelper(t *testing.T) {
 	if !ok || got != "C:/GManager/saves/placeholder" {
 		t.Fatalf("userdir = %q ok=%v", got, ok)
 	}
+	if dir, ok := New().ConfigSaveDir([]byte(`{"userdir":"C:/GManager/saves/placeholder"}`)); !ok || dir != got {
+		t.Fatalf("ConfigSaveDir = %q ok=%v", dir, ok)
+	}
 	if _, ok := UserDir([]byte(`{"userdir":""}`)); ok {
 		t.Fatal("empty userdir reported as set")
 	}

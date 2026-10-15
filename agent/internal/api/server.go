@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/LeOtterTerry/GManager/agent/internal/backup"
 	"github.com/LeOtterTerry/GManager/agent/internal/config"
 	"github.com/LeOtterTerry/GManager/agent/internal/core"
 	"github.com/LeOtterTerry/GManager/agent/internal/supervisor"
@@ -47,18 +48,23 @@ func ValidateInstanceID(id string) error {
 
 // Options configures a local API server.
 type Options struct {
-	Token        string
-	InstanceID   string
-	Instance     core.Instance
-	Module       core.GameModule
-	Editor       *config.Editor
-	Jobs         *JobRunner
-	Logs         *LogStore
-	Limiter      *Limiter
-	Idem         *IdempotencyStore
-	Supervisor   *supervisor.Supervisor
-	Steam        supervisor.AppUpdater
-	Backup       supervisor.BackupFunc
+	Token      string
+	InstanceID string
+	Instance   core.Instance
+	Module     core.GameModule
+	Editor     *config.Editor
+	Jobs       *JobRunner
+	Logs       *LogStore
+	Limiter    *Limiter
+	Idem       *IdempotencyStore
+	Supervisor *supervisor.Supervisor
+	Steam      supervisor.AppUpdater
+	Backup     supervisor.BackupFunc
+	// Archives stores backups. When set, and Backup is nil, update uses it.
+	Archives *backup.Store
+	// UserDir overrides the save directory named in the game config.
+	// Empty means the module reads the config. A value here wins.
+	UserDir      string
 	ReadyTimeout time.Duration
 	// UIPort is the only origin port a browser may send. Zero uses DefaultUIPort.
 	UIPort int
@@ -79,6 +85,8 @@ type Server struct {
 	sup        *supervisor.Supervisor
 	steam      supervisor.AppUpdater
 	backup     supervisor.BackupFunc
+	archives   *backup.Store
+	userDir    string
 	acceptMu   sync.Mutex
 	handler    http.Handler
 }
@@ -139,6 +147,11 @@ func New(opt Options) (*Server, error) {
 		sup:        opt.Supervisor,
 		steam:      opt.Steam,
 		backup:     opt.Backup,
+		archives:   opt.Archives,
+		userDir:    opt.UserDir,
+	}
+	if s.backup == nil && s.archives != nil {
+		s.backup = s.updateBackup
 	}
 	s.handler = s.wrap(s.routes())
 	return s, nil
@@ -189,6 +202,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/v1/servers/{instanceId}/install", s.postInstall)
 	mux.HandleFunc("POST /api/v1/servers/{instanceId}/update", s.postUpdate)
 	mux.HandleFunc("POST /api/v1/servers/{instanceId}/backup", s.postBackup)
+	mux.HandleFunc("GET /api/v1/servers/{instanceId}/backups", s.getBackups)
 	mux.HandleFunc("POST /api/v1/servers/{instanceId}/restore", s.postRestore)
 	mux.HandleFunc("GET /api/v1/servers/{instanceId}/config", s.getConfig)
 	mux.HandleFunc("PUT /api/v1/servers/{instanceId}/config", s.putConfig)

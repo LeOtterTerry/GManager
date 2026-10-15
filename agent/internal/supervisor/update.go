@@ -10,6 +10,9 @@ import (
 	"github.com/LeOtterTerry/GManager/agent/internal/core"
 )
 
+// ErrBusy means install, update, backup, or restore is already running.
+var ErrBusy = errors.New("another server operation is in progress")
+
 // ErrBackupNotConfigured means update refused to continue without a backup hook.
 var ErrBackupNotConfigured = errors.New("backup hook is not configured")
 
@@ -31,6 +34,11 @@ func (s *Supervisor) Install(ctx context.Context, updater AppUpdater) error {
 	if updater == nil {
 		return errors.New("updater is required")
 	}
+	release, err := s.Hold()
+	if err != nil {
+		return err
+	}
+	defer release()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -82,6 +90,11 @@ func (s *Supervisor) Update(ctx context.Context, updater AppUpdater, backup Back
 	if backup == nil {
 		return ErrBackupNotConfigured
 	}
+	release, err := s.Hold()
+	if err != nil {
+		return err
+	}
+	defer release()
 	if ctx == nil {
 		ctx = context.Background()
 	}

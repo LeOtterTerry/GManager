@@ -42,17 +42,20 @@ func newAPIOpt(t *testing.T, limit int, extra Options) (*Server, *httptest.Serve
 		jobs = NewJobRunner(true)
 	}
 	opt := Options{
-		Token:      "test-token",
-		InstanceID: "default",
-		Instance:   core.Instance{ID: "default", Dir: dir},
-		Module:     plainsofpain.New(),
-		Editor:     ed,
-		Jobs:       jobs,
-		Logs:       NewLogStore(),
-		Limiter:    NewLimiter(limit, time.Minute),
-		Steam:      extra.Steam,
-		Backup:     extra.Backup,
-		Supervisor: extra.Supervisor,
+		Token:        "test-token",
+		InstanceID:   "default",
+		Instance:     core.Instance{ID: "default", Dir: dir},
+		Module:       plainsofpain.New(),
+		Editor:       ed,
+		Jobs:         jobs,
+		Logs:         NewLogStore(),
+		Limiter:      NewLimiter(limit, time.Minute),
+		Steam:        extra.Steam,
+		Backup:       extra.Backup,
+		Archives:     extra.Archives,
+		UserDir:      extra.UserDir,
+		ReadyTimeout: extra.ReadyTimeout,
+		Supervisor:   extra.Supervisor,
 	}
 	srv, err := New(opt)
 	if err != nil {

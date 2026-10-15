@@ -1,14 +1,10 @@
 //go:build windows
 
-package supervisor
+package disk
 
 import "golang.org/x/sys/windows"
 
-func init() {
-	diskFree = windowsDiskFree
-}
-
-func windowsDiskFree(path string) (uint64, error) {
+func platformFree(path string) (uint64, error) {
 	p, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return 0, err

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/LeOtterTerry/GManager/agent/internal/backup"
 	"github.com/LeOtterTerry/GManager/agent/internal/config"
 	"github.com/LeOtterTerry/GManager/agent/internal/core"
 	"github.com/LeOtterTerry/GManager/agent/internal/supervisor"
@@ -119,19 +120,126 @@ func (s *Server) postUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) postBackup(w http.ResponseWriter, r *http.Request) {
-	s.acceptAction(w, r, false, "backup", func(context.Context) (any, error) {
-		return map[string]any{"action": "backup", "implemented": false, "reason": "backups are not in this slice"}, nil
+	if !s.knownInstance(w, r) {
+		return
+	}
+	body, err := readBody(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: "invalid_body", Message: bodyReadMessage(err)})
+		return
+	}
+	s.accept(w, r, body, func() decision {
+		if s.archives == nil {
+			return decision{Status: http.StatusNotImplemented, Body: errorBody{
+				Error:   "not_implemented",
+				Message: "backup directory is not configured",
+			}}
+		}
+		job := s.jobs.Start("backup", s.instanceID, s.backupWork)
+		return decision{
+			Status: http.StatusAccepted,
+			Body:   map[string]string{"jobId": job.ID},
+			JobID:  job.ID,
+			Store:  true,
+		}
 	})
 }
 
 func (s *Server) postRestore(w http.ResponseWriter, r *http.Request) {
-	s.acceptAction(w, r, true, "restore", func(context.Context) (any, error) {
-		return map[string]any{"action": "restore", "implemented": false, "reason": "restore is not in this slice"}, nil
+	if !s.knownInstance(w, r) {
+		return
+	}
+	body, err := readBody(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: "invalid_body", Message: bodyReadMessage(err)})
+		return
+	}
+	s.accept(w, r, body, func() decision {
+		ok, err := confirmed(body)
+		if err != nil {
+			return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "invalid_body", Message: "body must be JSON"}}
+		}
+		if !ok {
+			return decision{Status: http.StatusBadRequest, Body: errorBody{
+				Error:   "confirm_required",
+				Message: "restore requires confirm=true",
+			}}
+		}
+		id, err := backupID(body)
+		if err != nil {
+			return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "backup_id_required", Message: "restore requires a backup id"}}
+		}
+		if s.archives == nil {
+			return decision{Status: http.StatusNotImplemented, Body: errorBody{
+				Error:   "not_implemented",
+				Message: "backup directory is not configured",
+			}}
+		}
+		if err := s.archives.Exists(id); err != nil {
+			if errors.Is(err, backup.ErrInvalidID) {
+				return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "invalid_backup_id", Message: "invalid backup id"}}
+			}
+			if errors.Is(err, backup.ErrNotFound) {
+				return decision{Status: http.StatusNotFound, Body: errorBody{Error: "not_found", Message: "unknown backup"}}
+			}
+			return decision{Status: http.StatusInternalServerError, Body: errorBody{Error: "internal", Message: "could not read backups"}}
+		}
+		job := s.jobs.Start("restore", s.instanceID, func(ctx context.Context) (any, error) {
+			return s.restoreWork(ctx, id)
+		})
+		return decision{
+			Status: http.StatusAccepted,
+			Body:   map[string]string{"jobId": job.ID},
+			JobID:  job.ID,
+			Store:  true,
+		}
+	})
+}
+
+func (s *Server) getBackups(w http.ResponseWriter, r *http.Request) {
+	if !s.knownInstance(w, r) {
+		return
+	}
+	if s.archives == nil {
+		writeJSON(w, http.StatusNotImplemented, errorBody{
+			Error:   "not_implemented",
+			Message: "backup directory is not configured",
+		})
+		return
+	}
+	limit, err := parseLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: "invalid_limit", Message: "limit must be an integer from 1 to 500"})
+		return
+	}
+	items, next, err := s.archives.List(r.URL.Query().Get("cursor"), limit)
+	if errors.Is(err, backup.ErrInvalidCursor) {
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: "invalid_cursor", Message: "cursor must be a backup id"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody{Error: "backup_list_failed", Message: err.Error()})
+		return
+	}
+	keep := s.archives.Keep
+	if keep < 1 {
+		keep = backup.DefaultKeep
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"backupDir":  s.archives.Dir,
+		"keep":       keep,
+		"items":      items,
+		"nextCursor": next,
 	})
 }
 
 func (s *Server) startWork(ctx context.Context) (any, error) {
 	return s.guardConfig("start", func() (any, error) {
+		release, err := s.sup.Hold()
+		if err != nil {
+			return nil, err
+		}
+		defer release()
 		if err := s.sup.Start(ctx, s.inst, s.mod); err != nil {
 			return nil, err
 		}
@@ -140,6 +248,11 @@ func (s *Server) startWork(ctx context.Context) (any, error) {
 }
 
 func (s *Server) stopWork(ctx context.Context) (any, error) {
+	release, err := s.sup.Hold()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if err := s.sup.Stop(ctx); err != nil {
@@ -151,6 +264,11 @@ func (s *Server) stopWork(ctx context.Context) (any, error) {
 
 func (s *Server) restartWork(ctx context.Context) (any, error) {
 	return s.guardConfig("restart", func() (any, error) {
+		release, err := s.sup.Hold()
+		if err != nil {
+			return nil, err
+		}
+		defer release()
 		if err := s.sup.Restart(ctx); err != nil {
 			return nil, err
 		}
@@ -188,6 +306,166 @@ func (s *Server) updateWork(ctx context.Context) (any, error) {
 		}
 		return s.processResult("update"), nil
 	})
+}
+
+func (s *Server) backupWork(ctx context.Context) (any, error) {
+	return s.guardConfig("backup", func() (any, error) {
+		var entry backup.Entry
+		restarted, err := s.sup.RunStopped(ctx, func(ctx context.Context) error {
+			var createErr error
+			entry, createErr = s.createBackup(ctx, s.inst, backup.KindManual, nil)
+			return createErr
+		})
+		if err != nil {
+			if entry.ID != "" {
+				return nil, fmt.Errorf("backup %s was written: %w", entry.ID, err)
+			}
+			return nil, err
+		}
+		s.logs.Append("backup " + entry.ID)
+		return backupResult(entry, restarted), nil
+	})
+}
+
+func (s *Server) restoreWork(ctx context.Context, id string) (any, error) {
+	if err := s.archives.Verify(id); err != nil {
+		return nil, err
+	}
+	release, err := s.sup.Hold()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	st := s.sup.Status()
+	wasRunning := st.State == supervisor.StateRunning || st.State == supervisor.StateStarting || st.PID != 0
+	if wasRunning {
+		stopCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		stopErr := s.sup.Stop(stopCtx)
+		cancel()
+		if stopErr != nil {
+			return nil, stopErr
+		}
+	}
+	inst := s.withSaveDir(s.inst)
+	safety, err := s.createBackup(ctx, inst, backup.KindSafety, []string{id})
+	if err != nil {
+		if wasRunning {
+			if startErr := s.sup.Start(context.Background(), s.inst, s.mod); startErr != nil {
+				return nil, fmt.Errorf("%w; restart failed: %v", err, startErr)
+			}
+		}
+		return nil, err
+	}
+	dest := inst
+	if s.userDir == "" {
+		dir, ok, dirErr := s.archivedSaveDir(id)
+		if dirErr != nil {
+			return nil, fmt.Errorf("safety backup %s was kept: %w", safety.ID, dirErr)
+		}
+		if ok {
+			dest.UserDir = dir
+		}
+	}
+	if err := s.archives.Restore(ctx, id, dest, s.mod); err != nil {
+		return nil, fmt.Errorf("safety backup %s was kept: %w", safety.ID, err)
+	}
+	if _, err := s.editor.Acknowledge(); err != nil {
+		return nil, fmt.Errorf("files were restored from %s but config state was not updated: %w", id, err)
+	}
+	s.logs.Append("restore " + id)
+	return map[string]any{
+		"action":   "restore",
+		"id":       id,
+		"safetyId": safety.ID,
+		"state":    s.sup.Status().State,
+	}, nil
+}
+
+func (s *Server) archivedSaveDir(id string) (string, bool, error) {
+	files := s.mod.ConfigFiles(s.inst)
+	if len(files) == 0 {
+		return "", false, nil
+	}
+	raw, err := s.archives.Config(id, files[0].RelPath)
+	if err != nil {
+		return "", false, err
+	}
+	dir, ok := s.mod.ConfigSaveDir(raw)
+	return dir, ok, nil
+}
+
+func (s *Server) updateBackup(ctx context.Context, inst core.Instance) error {
+	_, err := s.createBackup(ctx, inst, backup.KindUpdate, nil)
+	return err
+}
+
+func (s *Server) createBackup(ctx context.Context, inst core.Instance, kind string, protect []string) (backup.Entry, error) {
+	if s.archives == nil {
+		return backup.Entry{}, errors.New("backup directory is not configured")
+	}
+	if err := s.requireQuiesced(); err != nil {
+		return backup.Entry{}, err
+	}
+	return s.archives.Create(ctx, backup.Request{
+		Instance: s.withSaveDir(inst),
+		Module:   s.mod,
+		Kind:     kind,
+		Protect:  protect,
+	})
+}
+
+func (s *Server) requireQuiesced() error {
+	st := s.sup.Status()
+	if st.PID != 0 || st.State == supervisor.StateRunning || st.State == supervisor.StateStarting {
+		return backup.ErrServerRunning
+	}
+	return nil
+}
+
+func (s *Server) withSaveDir(inst core.Instance) core.Instance {
+	if s.userDir != "" {
+		inst.UserDir = s.userDir
+		return inst
+	}
+	if inst.UserDir != "" {
+		return inst
+	}
+	raw, err := os.ReadFile(s.editor.ConfigPath())
+	if err != nil {
+		return inst
+	}
+	if dir, ok := s.mod.ConfigSaveDir(raw); ok {
+		inst.UserDir = dir
+	}
+	return inst
+}
+
+func backupResult(entry backup.Entry, restarted bool) map[string]any {
+	return map[string]any{
+		"action":    "backup",
+		"id":        entry.ID,
+		"kind":      entry.Kind,
+		"bytes":     entry.Bytes,
+		"fileCount": entry.FileCount,
+		"createdAt": entry.CreatedAt,
+		"restarted": restarted,
+	}
+}
+
+func backupID(body []byte) (string, error) {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return "", errors.New("missing")
+	}
+	var payload struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(payload.ID) == "" {
+		return "", errors.New("missing")
+	}
+	return payload.ID, nil
 }
 
 func (s *Server) processResult(action string) map[string]any {

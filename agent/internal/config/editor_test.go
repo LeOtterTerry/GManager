@@ -446,3 +446,45 @@ func TestMetaDoesNotStorePassword(t *testing.T) {
 		t.Fatalf("metadata contains the password after save:\n%s", again)
 	}
 }
+
+func TestAcknowledgeRecordsRestoreWithoutRewriting(t *testing.T) {
+	ed, path := newTestEditor(t)
+	writeFile(t, path, "{\"serverName\":\"A\"}\n")
+	before := mustRead(t, ed)
+	restored := "{\"serverName\":\"restored\",\"password\":\"placeholder-password\"}\n"
+	writeFile(t, path, restored)
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := ed.Acknowledge()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ExternalChange || got.Revision != before.Revision+1 || string(got.Content) != restored {
+		t.Fatalf("ack = %+v", got)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(info.ModTime()) || readFile(t, path) != restored {
+		t.Fatal("acknowledge rewrote the config file")
+	}
+	meta := readFile(t, filepath.Join(filepath.Dir(path), "..", "state", "server.json.meta"))
+	// state path is beside the temp root's state dir; read it from the editor by a second acknowledge.
+	again, err := ed.Acknowledge()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Revision != got.Revision || again.ExternalChange {
+		t.Fatalf("second ack = %+v", again)
+	}
+	view := mustRead(t, ed)
+	if view.ExternalChange || string(view.Content) != restored {
+		t.Fatalf("read = %+v", view)
+	}
+	if strings.Contains(meta, "placeholder-password") {
+		t.Fatalf("metadata contains the password:\n%s", meta)
+	}
+}

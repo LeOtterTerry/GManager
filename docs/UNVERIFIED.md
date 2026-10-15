@@ -6,7 +6,7 @@ Someone with a real install needs to confirm the rows below. Until then the agen
 
 | Item | What is unverified | Current behavior |
 |---|---|---|
-| Default save path | Where the dedicated server writes saves when `userdir` is empty. | `SavePaths` returns an error unless `userdir` is set. No default path is invented. |
+| Default save path | Where the dedicated server writes saves when `userdir` is empty. | `SavePaths` returns an error unless `userdir` or `--user-dir` is set. Backups and restore fail closed and do not invent a directory. `--user-dir` wins over `userdir` when both are set. |
 | Clean stop on Windows | Whether a window message, stdin command, or other request stops `PlainsOfPain.exe` without killing it. | The module stop method is unknown. Stop kills the process (`TerminateJobObject` on Windows, `SIGKILL` on Unix). That can lose data. |
 | `SIGTERM` / `--stop-method interrupt` | Whether an interrupt is a clean Plains of Pain stop. | Not used unless the operator sets `--stop-method interrupt`. On Unix that sends `SIGTERM` to the process group. On Windows the interrupt is refused and, when the module allows it, the process is killed. This is not a confirmed game stop. |
 | Windows Job Object | Whether a job object contains `PlainsOfPain.exe` and every child it starts. | The fakeserver is created suspended, assigned to a job with `KILL_ON_JOB_CLOSE`, and resumed. Its child process is dead after `TerminateJobObject` and after the job handle is closed. Containing the real dedicated server is still unverified. |

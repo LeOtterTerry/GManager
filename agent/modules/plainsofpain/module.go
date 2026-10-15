@@ -133,5 +133,11 @@ func (m *Module) SavePaths(inst core.Instance) ([]string, error) {
 	return []string{inst.UserDir}, nil
 }
 
+// ConfigSaveDir returns userdir when the config names one.
+// It does not invent the dedicated server's default save directory.
+func (m *Module) ConfigSaveDir(cfg []byte) (string, bool) {
+	return UserDir(cfg)
+}
+
 // Schema returns the embedded JSON Schema for server.json.
 func (m *Module) Schema() []byte { return schemaJSON }

@@ -28,7 +28,8 @@ func (f fakeModule) CrashSignals() []*regexp.Regexp { return nil }
 func (f fakeModule) SavePaths(Instance) ([]string, error) {
 	return nil, ErrSavePathUnknown
 }
-func (f fakeModule) Ports([]byte) []PortSpec { return nil }
+func (f fakeModule) ConfigSaveDir([]byte) (string, bool) { return "", false }
+func (f fakeModule) Ports([]byte) []PortSpec             { return nil }
 func (f fakeModule) Warnings([]byte) []string {
 	return nil
 }

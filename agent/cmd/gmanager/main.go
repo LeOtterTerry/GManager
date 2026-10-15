@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/LeOtterTerry/GManager/agent/internal/api"
+	"github.com/LeOtterTerry/GManager/agent/internal/backup"
 	"github.com/LeOtterTerry/GManager/agent/internal/config"
 	"github.com/LeOtterTerry/GManager/agent/internal/core"
 	"github.com/LeOtterTerry/GManager/agent/internal/steamcmd"
@@ -35,6 +36,9 @@ func main() {
 	stopMethod := flag.String("stop-method", "", "stop override: empty uses the module; interrupt is SIGTERM on Unix and is not a confirmed Plains of Pain clean stop")
 	console := flag.Bool("console-commands", false, "pass -cc (UNVERIFIED on Windows; default false)")
 	steamTimeout := flag.Duration("steamcmd-timeout", steamcmd.DefaultRunTimeout, "maximum time for one SteamCMD install or update")
+	backupDir := flag.String("backup-dir", "", "backup directory (default P:\\GManager\\Backups when drive P: exists, otherwise <data-dir>/backups)")
+	backupKeep := flag.Int("backup-keep", backup.DefaultKeep, "how many backups to keep; the oldest are deleted past this count")
+	userDir := flag.String("user-dir", "", "save directory override; empty reads userdir from server.json. The game's default save path is unverified")
 	flag.Parse()
 
 	dirData := *dataDir
@@ -60,6 +64,9 @@ func main() {
 	}
 	if *steamTimeout <= 0 {
 		stderr.Fatal("steamcmd-timeout must be positive")
+	}
+	if *backupKeep < 1 {
+		stderr.Fatal("backup-keep must be at least 1")
 	}
 	switch core.StopMethod(*stopMethod) {
 	case core.StopUnknown, core.StopInterrupt:
@@ -88,6 +95,10 @@ func main() {
 	sup.SetStopMethod(core.StopMethod(*stopMethod))
 	steam := steamcmd.New(filepath.Join(dirData, "steamcmd"))
 	steam.Timeout = *steamTimeout
+	dirBackup := *backupDir
+	if dirBackup == "" {
+		dirBackup = backup.DefaultDir(dirData, nil)
+	}
 	srv, err := api.New(api.Options{
 		Token:      token,
 		InstanceID: *instance,
@@ -102,8 +113,8 @@ func main() {
 		Logs:       logs,
 		Supervisor: sup,
 		Steam:      steam,
-		// Update stays 501 until a real backup hook exists.
-		Backup: nil,
+		Archives:   &backup.Store{Dir: dirBackup, Keep: *backupKeep},
+		UserDir:    *userDir,
 	})
 	if err != nil {
 		stderr.Fatal(err)
