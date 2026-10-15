@@ -69,6 +69,10 @@ const (
 	// StopUnknown means the core must not invent a graceful stop
 	// (no guessed signal, window message, or stdin command).
 	StopUnknown StopMethod = ""
+	// StopInterrupt asks the OS to interrupt the process (SIGTERM on Unix).
+	// This is not a confirmed Plains of Pain clean stop. Leave the module on
+	// StopUnknown until a real install shows a method that works.
+	StopInterrupt StopMethod = "interrupt"
 )
 
 // StopSpec is the module's stop policy.

@@ -4,7 +4,7 @@ GManager is a free, open-source (MIT) Windows game-server manager. A Go agent ru
 
 The first game module is Plains of Pain (SteamCMD app 2227360).
 
-This repository is the foundation slice. It does not install a Windows service, download a game server, or open firewall ports.
+This tree is the foundation plus the process supervisor and SteamCMD installer. It does not install a Windows service or open firewall ports. CI does not download Steam or Plains of Pain.
 
 ## License
 
@@ -17,11 +17,12 @@ MIT. See [LICENSE](LICENSE).
 - [v0.1 scope](docs/V0.1-SCOPE.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Local API contract](docs/API.md)
+- [Unverified game behavior](docs/UNVERIFIED.md)
 
 ## Layout
 
 ```
-agent/          Go module. cmd/gmanager, core, config editor, local API
+agent/          Go module. cmd/gmanager, cmd/fakeserver, supervisor, steamcmd, local API
 agent/modules/plainsofpain
 web/            Dashboard shell (TypeScript + Vite)
 docs/           Scope, architecture, API
@@ -51,7 +52,9 @@ Defaults:
 - revision metadata: `<data-dir>/state/default/server.json.meta`
 - token file, when generated: `<data-dir>/token`
 
-Flags: `--data-dir`, `--server-dir`, `--instance` (default `default`), `--ui-port` (default `5173`). An instance id starts with a letter or digit and may contain letters, digits, `_`, and `-`, up to 64 characters. The API accepts a browser `Origin` only on `--ui-port`.
+Flags: `--data-dir`, `--server-dir`, `--instance` (default `default`), `--ui-port` (default `5173`), `--stop-method` (empty, or `interrupt`), `--console-commands` (default false), `--steamcmd-timeout` (default `60m`). An instance id starts with a letter or digit and may contain letters, digits, `_`, and `-`, up to 64 characters. The API accepts a browser `Origin` only on `--ui-port`.
+
+`--stop-method` defaults to empty, which uses the module. Plains of Pain's clean stop is unknown, so stop kills the process. `interrupt` sends SIGTERM on Unix and is not a confirmed game stop. `--console-commands` adds `-cc`. Leave it off until that flag is confirmed. SteamCMD is stored under `<data-dir>/steamcmd`. Restart requires `confirm: true`. Update returns 501 until a backup hook exists; the agent does not invent one.
 
 Dashboard, in another terminal:
 
@@ -74,14 +77,16 @@ cd web && npm run build
 
 Config validation and the external-edit safeguard are covered in `agent/modules/plainsofpain` and `agent/internal/config`. The API tests cover 202 jobs, idempotency, `If-Match` 409, cursor logs, confirm, and 429. CI also runs `go test ./...` on `windows-latest`, which builds and runs the Windows-only files.
 
+Process tests use `agent/cmd/fakeserver`, a small stand-in that prints `Set Game State: RUNNING` and can crash, hang, or exit on an interrupt. Those tests do not contact Steam. SteamCMD tests extract a local archive or run a stand-in script.
+
 ## Unknowns (do not guess)
 
-These stay configurable and unresolved until a real Plains of Pain install confirms them:
+These stay configurable and unresolved until a real Plains of Pain install confirms them. The checklist is [docs/UNVERIFIED.md](docs/UNVERIFIED.md).
 
 | Topic | Behavior in this slice |
 |---|---|
 | Default save path | `SavePaths` returns an error unless `userdir` is set. No default path is invented. |
-| Clean stop on Windows | `StopStrategy` method is unknown. No signal, window message, or stdin command is assumed. |
+| Clean stop on Windows | `StopStrategy` method is unknown. Stop kills the process (`TerminateJobObject` on Windows, `SIGKILL` on Unix). |
 | `-cc` console flag | Omitted unless the instance sets `EnableConsoleCommands`. Off by default. |
 | `adminAccountIDs` format | Preserved verbatim. Not type-checked. Fixtures use `STEAM64_PLACEHOLDER`, never a real Steam ID. |
 | `worldId`, `mapId`, `seed`, `ttr` | Preserved verbatim. Types are not guessed. |
@@ -90,8 +95,7 @@ These stay configurable and unresolved until a real Plains of Pain install confi
 ## Not in this slice
 
 - Windows service, installer, firewall consent
-- SteamCMD install and update
-- Process supervisor (Job Object), ready-line state, crash restart
+- Containing a real Plains of Pain process tree (the fakeserver runs in a job object; the game is unverified)
 - Dashboard login (Argon2id, cookies, CSRF) and `reset-password`
 - Config form and 3-way diff UI
 - Backups, restore, scheduled restart
@@ -101,4 +105,4 @@ These stay configurable and unresolved until a real Plains of Pain install confi
 - Reproducible release and `SHA256SUMS`
 - Public site
 
-The agent must not rewrite `server.json` on server start. `start` in this slice only returns the module's launch plan and checks that the config file is unchanged.
+The agent must not rewrite `server.json` on server start, stop, restart, install, or update. Start fails the job if the executable is missing. An unexpected exit restarts with backoff (1s, 5s, 15s, never more than 30s). After 3 crashes in 10 minutes the supervisor halts.
