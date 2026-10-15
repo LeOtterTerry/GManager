@@ -344,8 +344,9 @@ func TestRestoreWritesTheCurrentSaveDir(t *testing.T) {
 	if readSaveFile(t, saveB, "world.dat") != "alpha" {
 		t.Fatalf("current save = %q", readSaveFile(t, saveB, "world.dat"))
 	}
-	if mustRead(t, cfgPath) != original {
-		t.Fatalf("config = %s", mustRead(t, cfgPath))
+	named, ok := plainsofpain.New().ConfigSaveDir([]byte(mustRead(t, cfgPath)))
+	if !ok || !backup.SamePath(named, saveB) {
+		t.Fatalf("config userdir = %q ok=%v body=%s", named, ok, mustRead(t, cfgPath))
 	}
 }
 
@@ -401,6 +402,76 @@ func TestRestoreRefusesForeignSaveDirUnlessItIsEmpty(t *testing.T) {
 	}
 	if readSaveFile(t, saveB, "world.dat") != "nope" {
 		t.Fatalf("current save = %q", readSaveFile(t, saveB, "world.dat"))
+	}
+}
+
+func TestRestoreRechecksForeignDirAfterStop(t *testing.T) {
+	saveA := t.TempDir()
+	saveB := t.TempDir()
+	archives := testArchives(t, 10)
+	srv, httpSrv, cfgPath := newAPIOpt(t, 100, Options{Archives: archives})
+	writeCfg(t, cfgPath, configJSON(t, saveA, "kept"))
+	writeSaveFile(t, saveA, "world.dat", "alpha")
+	status, body, _ := do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backup", "test-token", `{}`, nil)
+	if status != http.StatusAccepted {
+		t.Fatalf("backup = %d %s", status, body)
+	}
+	id, _ := succeededResult(t, httpSrv.URL, body)["id"].(string)
+	writeCfg(t, cfgPath, configJSON(t, saveB, "moved"))
+	writeSaveFile(t, saveB, "world.dat", "nope")
+	if err := os.RemoveAll(saveA); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(saveA, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	srv.afterQuiesce = func() {
+		writeSaveFile(t, saveA, "late.dat", "appeared")
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/restore", "test-token", `{"confirm":true,"confirmArchivedSaveDir":true,"id":"`+id+`"}`, nil)
+	if status != http.StatusAccepted {
+		t.Fatalf("restore = %d %s", status, body)
+	}
+	job := jobByID(t, httpSrv.URL, jsonString(t, body, "jobId"))
+	if !bytes.Contains(job, []byte(`"state":"failed"`)) || !bytes.Contains(job, []byte("not the save folder")) {
+		t.Fatalf("job = %s", job)
+	}
+	if readSaveFile(t, saveB, "world.dat") != "nope" {
+		t.Fatalf("current save = %q", readSaveFile(t, saveB, "world.dat"))
+	}
+}
+
+func TestDiscardRemovesOnlyQuarantine(t *testing.T) {
+	save := t.TempDir()
+	archives := testArchives(t, 10)
+	_, httpSrv, cfgPath := newAPIOpt(t, 100, Options{Archives: archives})
+	writeCfg(t, cfgPath, configJSON(t, save, "kept"))
+	writeSaveFile(t, save, "world.dat", "alpha")
+	status, body, _ := do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backup", "test-token", `{}`, nil)
+	if status != http.StatusAccepted {
+		t.Fatalf("backup = %d %s", status, body)
+	}
+	id, _ := succeededResult(t, httpSrv.URL, body)["id"].(string)
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/discard", "test-token", `{"id":"`+id+`"}`, nil)
+	if status != http.StatusBadRequest || !bytes.Contains(body, []byte("confirm_required")) {
+		t.Fatalf("confirm = %d %s", status, body)
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/discard", "test-token", `{"confirm":true,"id":"`+id+`"}`, nil)
+	if status != http.StatusConflict || !bytes.Contains(body, []byte("not_quarantined")) {
+		t.Fatalf("live = %d %s", status, body)
+	}
+	if _, err := os.Stat(filepath.Join(archives.Dir, id+".zip")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(archives.Dir, id+".zip"), filepath.Join(archives.Dir, id+".zip.quarantine")); err != nil {
+		t.Fatal(err)
+	}
+	status, body, _ = do(t, httpSrv.URL, http.MethodPost, "/api/v1/servers/default/backups/discard", "test-token", `{"confirm":true,"id":"`+id+`"}`, nil)
+	if status != http.StatusOK {
+		t.Fatalf("discard = %d %s", status, body)
+	}
+	if _, err := os.Stat(filepath.Join(archives.Dir, id+".zip.quarantine")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("quarantine err = %v", err)
 	}
 }
 

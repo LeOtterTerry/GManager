@@ -176,6 +176,14 @@ func TestRetentionPoolsKeepManualAndOneVerified(t *testing.T) {
 	}
 	corruptZipByte(t, filepath.Join(store.Dir, newer.ID+".zip"), false)
 	corruptZipByte(t, filepath.Join(store.Dir, update2.ID+".zip"), false)
+	// Bump mtime so a same-size rewrite is not served from the inventory cache.
+	bumped := time.Now().Add(2 * time.Second)
+	for _, id := range []string{newer.ID, update2.ID} {
+		path := filepath.Join(store.Dir, id+".zip")
+		if err := os.Chtimes(path, bumped, bumped); err != nil {
+			t.Fatal(err)
+		}
+	}
 	store.Keep = 1
 	if err := store.prune(nil); err != nil {
 		t.Fatal(err)
@@ -185,6 +193,25 @@ func TestRetentionPoolsKeepManualAndOneVerified(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(store.Dir, newer.ID+".zip")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("unreadable zip err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(store.Dir, newer.ID+".zip.quarantine")); err != nil {
+		t.Fatalf("unreadable zip was deleted instead of quarantined: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(store.Dir, update2.ID+".zip.quarantine")); err != nil {
+		t.Fatalf("unreadable update was deleted instead of quarantined: %v", err)
+	}
+	page, _, err := store.List("", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawQuarantine bool
+	for _, item := range page {
+		if item.ID == newer.ID && item.Corrupt && item.Quarantined {
+			sawQuarantine = true
+		}
+	}
+	if !sawQuarantine {
+		t.Fatalf("page = %+v", page)
 	}
 }
 
@@ -438,6 +465,55 @@ func TestFailedSwapRollsBackFromSafety(t *testing.T) {
 	}
 }
 
+func TestFailedSwapUndoesBeforeSafetyZip(t *testing.T) {
+	inst, mod, save := newWorld(t)
+	writeSave(t, save, "world.dat", "alpha")
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), Keep: 5, Key: testKey()}
+	ctx := context.Background()
+	old, err := store.Create(ctx, Request{Instance: inst, Module: mod, Kind: KindManual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSave(t, save, "world.dat", "live")
+	mutated, err := json.Marshal(map[string]string{
+		"serverName": "mutated",
+		"password":   "placeholder-password",
+		"userdir":    save,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inst.Dir, "configs", "server.json"), append(mutated, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	safety, err := store.Create(ctx, Request{Instance: inst, Module: mod, Kind: KindSafety, Protect: []string{old.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	store.swapFail = func() error {
+		calls++
+		if calls != 2 {
+			return nil
+		}
+		return errors.New("injected swap failure")
+	}
+	err = store.RestoreInto(ctx, old.ID, inst, mod, safety.ID)
+	if err == nil || strings.Contains(err.Error(), "rolled back") {
+		t.Fatalf("err = %v", err)
+	}
+	if got := readSave(t, save, "world.dat"); got != "live" {
+		t.Fatalf("world = %q", got)
+	}
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(save), ".gmanager-hold-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("holds left behind: %v", matches)
+	}
+}
+
 func TestCancelDuringSwapStillRestores(t *testing.T) {
 	inst, mod, save := newWorld(t)
 	writeSave(t, save, "world.dat", "alpha")
@@ -520,6 +596,292 @@ func TestZipBombCaps(t *testing.T) {
 	maxZipRatio, maxZipRatioFloor = prevRatio, prevFloor
 	if !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), "compression ratio") {
 		t.Fatalf("ratio = %v", err)
+	}
+}
+
+func TestMissingKeyDoesNotMintOrDelete(t *testing.T) {
+	inst, mod, save := newWorld(t)
+	writeSave(t, save, "world.dat", "v")
+	dir := filepath.Join(t.TempDir(), "backups")
+	keyPath := filepath.Join(t.TempDir(), "backup.hmac")
+	store := &Store{Dir: dir, Keep: 5, KeyPath: keyPath}
+	ctx := context.Background()
+	if _, err := store.Create(ctx, Request{Instance: inst, Module: mod, Kind: KindManual}); err != nil {
+		t.Fatal(err)
+	}
+	copies := []string{keyPath, keyPath + ".bak", filepath.Join(dir, "integrity.key")}
+	for _, path := range copies {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+			t.Fatalf("%s mode = %o", path, info.Mode().Perm())
+		}
+	}
+	if err := os.Remove(keyPath); err != nil {
+		t.Fatal(err)
+	}
+	store.loadedKey = nil
+	if _, err := store.Create(ctx, Request{Instance: inst, Module: mod, Kind: KindManual}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(keyPath); err != nil {
+		t.Fatalf("primary key was not restored from a copy: %v", err)
+	}
+	for _, path := range copies {
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store.loadedKey = nil
+	if _, err := store.Create(ctx, Request{Instance: inst, Module: mod, Kind: KindManual}); !errors.Is(err, ErrKeyMissing) {
+		t.Fatalf("err = %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".zip") {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Fatalf("zips = %d", n)
+	}
+}
+
+func TestUnsignedBackupIsSignedInPlace(t *testing.T) {
+	inst, mod, save := newWorld(t)
+	writeSave(t, save, "world.dat", "alpha")
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), Keep: 5, Key: testKey()}
+	ctx := context.Background()
+	entry, err := store.Create(ctx, Request{Instance: inst, Module: mod, Kind: KindManual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(store.Dir, entry.ID+".zip")
+	clearHMAC(t, path, false)
+	if err := store.Verify(entry.ID); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(manifestJSON(t, path), []byte(`"hmac"`)) {
+		t.Fatal("unsigned archive was not signed")
+	}
+	writeSave(t, save, "world.dat", "live")
+	if err := store.Restore(ctx, entry.ID, inst, mod); err != nil {
+		t.Fatal(err)
+	}
+	if got := readSave(t, save, "world.dat"); got != "alpha" {
+		t.Fatalf("world = %q", got)
+	}
+
+	entry, err = store.Create(ctx, Request{Instance: inst, Module: mod, Kind: KindManual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path = filepath.Join(store.Dir, entry.ID+".zip")
+	clearHMAC(t, path, true)
+	if err := os.Chtimes(path, time.Now().Add(2*time.Second), time.Now().Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Verify(entry.ID); !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("bad hash = %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	}
+	store.Keep = 1
+	if err := store.prune([]string{entry.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.prune(nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unclassifiable zip still present: %v", err)
+	}
+	if _, err := os.Stat(path + ".quarantine"); err != nil {
+		t.Fatalf("quarantine = %v", err)
+	}
+	if err := store.Discard(entry.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path + ".quarantine"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("discard left the quarantine file")
+	}
+	kept, err := store.Create(ctx, Request{Instance: inst, Module: mod, Kind: KindManual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Discard(kept.ID); !errors.Is(err, ErrNotQuarantined) {
+		t.Fatalf("live discard = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(store.Dir, kept.ID+".zip")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInventoryCacheSkipsUnchangedZips(t *testing.T) {
+	inst, mod, save := newWorld(t)
+	writeSave(t, save, "world.dat", "v")
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), Keep: 5, Key: testKey()}
+	entry, err := store.Create(context.Background(), Request{Instance: inst, Module: mod, Kind: KindManual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(store.Dir, entry.ID+".zip")
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corruptZipByte(t, path, false)
+	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	page, _, err := store.List("", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 1 || page[0].Corrupt {
+		t.Fatalf("cached page = %+v", page)
+	}
+	now := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(path, now, now); err != nil {
+		t.Fatal(err)
+	}
+	page, _, err = store.List("", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 1 || !page[0].Corrupt {
+		t.Fatalf("restatted page = %+v", page)
+	}
+}
+
+func TestRecoverRestoresHoldAndDropsStaging(t *testing.T) {
+	root := t.TempDir()
+	dest := filepath.Join(root, "saves")
+	hold := filepath.Join(root, ".gmanager-hold-saves")
+	if err := os.MkdirAll(hold, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hold, "world.dat"), []byte("held"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	staging := filepath.Join(root, ".gmanager-restore-abc")
+	if err := os.MkdirAll(staging, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := Recover(dest); err != nil {
+		t.Fatal(err)
+	}
+	if got := readSave(t, dest, "world.dat"); got != "held" {
+		t.Fatalf("world = %q", got)
+	}
+	if _, err := os.Stat(staging); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("staging directory was kept")
+	}
+	extra := filepath.Join(root, ".gmanager-hold-saves.2")
+	if err := os.MkdirAll(extra, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := Recover(dest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(extra); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("committed hold was kept")
+	}
+
+	cfgDir := t.TempDir()
+	cfg := filepath.Join(cfgDir, "server.json")
+	cfgHold := filepath.Join(cfgDir, ".gmanager-hold-server.json")
+	if err := os.WriteFile(cfgHold, []byte("old-config"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Recover(cfg); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "old-config" {
+		t.Fatalf("config = %q", b)
+	}
+
+	undoDir := t.TempDir()
+	undoDest := filepath.Join(undoDir, "saves")
+	junk := undoDest + ".gmanager-undo"
+	if err := os.MkdirAll(junk, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(junk, "world.dat"), []byte("undo"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Recover(undoDest); err != nil {
+		t.Fatal(err)
+	}
+	if got := readSave(t, undoDest, "world.dat"); got != "undo" {
+		t.Fatalf("undo world = %q", got)
+	}
+}
+
+func TestCaseCollidingZipEntries(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a.dat")
+	b := filepath.Join(dir, "b.dat")
+	if err := os.WriteFile(a, []byte("A"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(b, []byte("B"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	id := "20261015T120000.000000000Z"
+	man := Manifest{
+		Version:    manifestVer,
+		ID:         id,
+		CreatedAt:  time.Now().UTC(),
+		InstanceID: "default",
+		GameID:     "plainsofpain",
+		Kind:       KindManual,
+		Saves:      []SaveRoot{{Index: 0}},
+	}
+	files := []sourceFile{
+		{abs: a, entry: ManifestFile{Path: "saves/0/World.dat", Role: roleSave, Root: 0, Rel: "World.dat"}},
+		{abs: b, entry: ManifestFile{Path: "saves/0/world.dat", Role: roleSave, Root: 0, Rel: "world.dat"}},
+	}
+	zipPath := filepath.Join(dir, id+".zip")
+	if _, err := writeZip(zipPath, man, files, testKey()); err != nil {
+		t.Fatal(err)
+	}
+	store := &Store{Dir: dir, Keep: 5, Key: testKey()}
+	err := store.Verify(id)
+	if !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), "case-colliding") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestAdaptConfigRefusesBeforeSwap(t *testing.T) {
+	inst, mod, save := newWorld(t)
+	writeSave(t, save, "world.dat", "alpha")
+	store := &Store{Dir: filepath.Join(t.TempDir(), "backups"), Keep: 5, Key: testKey()}
+	entry, err := store.Create(context.Background(), Request{Instance: inst, Module: mod, Kind: KindManual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSave(t, save, "world.dat", "live")
+	store.AdaptConfig = func(string, []byte) ([]byte, error) {
+		return nil, errors.New("refusing to restore")
+	}
+	err = store.Restore(context.Background(), entry.ID, inst, mod)
+	if err == nil || !strings.Contains(err.Error(), "refusing to restore") {
+		t.Fatalf("err = %v", err)
+	}
+	if got := readSave(t, save, "world.dat"); got != "live" {
+		t.Fatalf("world = %q", got)
 	}
 }
 
@@ -695,6 +1057,89 @@ func corruptZipByte(t *testing.T, path string, manifest bool) {
 	}
 	b[off] ^= 0xff
 	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func clearHMAC(t *testing.T, path string, badHash bool) {
+	t.Helper()
+	r, err := zip.OpenReader(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type item struct {
+		name string
+		body []byte
+	}
+	var items []item
+	for _, f := range r.File {
+		rc, err := f.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := io.ReadAll(rc)
+		if closeErr := rc.Close(); closeErr != nil {
+			t.Fatal(closeErr)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		items = append(items, item{name: f.Name, body: b})
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	changed := false
+	for i := range items {
+		if items[i].name != manifestName {
+			continue
+		}
+		var man Manifest
+		if err := json.Unmarshal(items[i].body, &man); err != nil {
+			t.Fatal(err)
+		}
+		man.HMAC = ""
+		if badHash {
+			if len(man.Files) == 0 || len(man.Files[0].SHA256) == 0 {
+				t.Fatal("manifest has nothing to rewrite")
+			}
+			sum := []byte(man.Files[0].SHA256)
+			if sum[0] == '0' {
+				sum[0] = '1'
+			} else {
+				sum[0] = '0'
+			}
+			man.Files[0].SHA256 = string(sum)
+		}
+		raw, err := json.MarshalIndent(man, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		items[i].body = append(raw, '\n')
+		changed = true
+		break
+	}
+	if !changed {
+		t.Fatal("manifest missing")
+	}
+	out, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(out)
+	for _, item := range items {
+		w, err := zw.Create(item.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write(item.body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := out.Close(); err != nil {
 		t.Fatal(err)
 	}
 }

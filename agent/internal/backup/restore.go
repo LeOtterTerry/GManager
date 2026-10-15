@@ -82,11 +82,14 @@ func (s *Store) RestoreInto(ctx context.Context, id string, inst core.Instance, 
 			}
 		}()
 	}
+	if err := recoverInstance(inst, mod); err != nil {
+		return err
+	}
 	plan, err := prepare(ctx, a, inst, mod, s.Dir, s.ensureSpace)
 	if err != nil {
 		return err
 	}
-	staged, err := stageAll(ctx, a, plan)
+	staged, err := stageAll(ctx, a, plan, s.AdaptConfig)
 	if err != nil {
 		if discardErr := staged.discard(); discardErr != nil {
 			return errors.Join(err, discardErr)
@@ -99,30 +102,28 @@ func (s *Store) RestoreInto(ctx context.Context, id string, inst core.Instance, 
 		}
 		return err
 	}
-	// Swaps are the point of no return for cancellation. A failure rolls
-	// the destination back from the safety archive when one was provided.
+	// Swaps are the point of no return for cancellation. A failure puts the
+	// previous names back with undo first. The safety zip is used only when
+	// that rename-back fails. Hold folders stay until that rollback commits.
 	if err := s.commit(staged); err != nil {
-		if staged.dirty && safety != nil {
-			rbErr := s.apply(safety, plan)
-			if discardErr := staged.discard(); discardErr != nil {
-				rbErr = errors.Join(rbErr, discardErr)
-			}
-			if holdErr := staged.removeHolds(); holdErr != nil {
-				rbErr = errors.Join(rbErr, holdErr)
-			}
-			if rbErr != nil {
-				return fmt.Errorf("%w; rollback from safety backup %s failed: %v", err, safetyID, rbErr)
-			}
-			return fmt.Errorf("%w; rolled back from safety backup %s", err, safetyID)
-		}
 		undoErr := staged.undo()
 		if discardErr := staged.discard(); discardErr != nil {
 			undoErr = errors.Join(undoErr, discardErr)
 		}
-		if undoErr != nil {
-			return errors.Join(err, undoErr)
+		if undoErr == nil {
+			return err
 		}
-		return err
+		if safety != nil && staged.dirty {
+			rbErr := s.apply(safety, plan)
+			if rbErr != nil {
+				return fmt.Errorf("%w; undo failed: %v; rollback from safety backup %s failed: %v", err, undoErr, safetyID, rbErr)
+			}
+			if holdErr := staged.removeHolds(); holdErr != nil {
+				return fmt.Errorf("%w; rolled back from safety backup %s; removing the previous copy failed: %v", err, safetyID, holdErr)
+			}
+			return fmt.Errorf("%w; rolled back from safety backup %s", err, safetyID)
+		}
+		return errors.Join(err, undoErr)
 	}
 	if err := staged.removeHolds(); err != nil {
 		return fmt.Errorf("restored files are in place, removing the previous copy failed: %w", err)
@@ -222,7 +223,7 @@ type stagedFile struct {
 	swapped bool
 }
 
-func stageAll(ctx context.Context, a *archive, plan restorePlan) (*stagedSet, error) {
+func stageAll(ctx context.Context, a *archive, plan restorePlan, adapt func(string, []byte) ([]byte, error)) (*stagedSet, error) {
 	st := &stagedSet{}
 	for i, root := range plan.saves {
 		if err := ctx.Err(); err != nil {
@@ -238,7 +239,7 @@ func stageAll(ctx context.Context, a *archive, plan restorePlan) (*stagedSet, er
 		if err := ctx.Err(); err != nil {
 			return st, err
 		}
-		file, err := stageConfig(a, cf)
+		file, err := stageConfig(a, cf, adapt)
 		if err != nil {
 			return st, err
 		}
@@ -277,7 +278,7 @@ func stageSave(a *archive, index int, dest string) (stagedDir, error) {
 	return stagedDir{dest: dest, tmp: tmp}, nil
 }
 
-func stageConfig(a *archive, dest configDest) (stagedFile, error) {
+func stageConfig(a *archive, dest configDest, adapt func(string, []byte) ([]byte, error)) (stagedFile, error) {
 	var file ManifestFile
 	found := false
 	for _, f := range a.man.Files {
@@ -311,7 +312,48 @@ func stageConfig(a *archive, dest configDest) (stagedFile, error) {
 	if err := extractChecked(a, file, tmpName); err != nil {
 		return stagedFile{}, err
 	}
+	if adapt != nil {
+		body, err := os.ReadFile(tmpName)
+		if err != nil {
+			if removeErr := os.Remove(tmpName); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				return stagedFile{}, errors.Join(err, removeErr)
+			}
+			return stagedFile{}, err
+		}
+		updated, err := adapt(dest.rel, body)
+		if err != nil {
+			if removeErr := os.Remove(tmpName); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				return stagedFile{}, errors.Join(err, removeErr)
+			}
+			return stagedFile{}, err
+		}
+		if !bytes.Equal(body, updated) {
+			if err := rewriteFile(tmpName, updated); err != nil {
+				if removeErr := os.Remove(tmpName); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+					return stagedFile{}, errors.Join(err, removeErr)
+				}
+				return stagedFile{}, err
+			}
+		}
+	}
 	return stagedFile{dest: dest.abs, tmp: tmpName}, nil
+}
+
+func rewriteFile(path string, body []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0)
+	if err != nil {
+		return err
+	}
+	_, werr := f.Write(body)
+	serr := f.Sync()
+	cerr := f.Close()
+	if werr != nil {
+		return werr
+	}
+	if serr != nil {
+		return serr
+	}
+	return cerr
 }
 
 func (s *Store) commit(st *stagedSet) error {
@@ -359,7 +401,7 @@ func (s *Store) apply(a *archive, plan restorePlan) error {
 	prev := s.swapFail
 	s.swapFail = nil
 	defer func() { s.swapFail = prev }()
-	staged, err := stageAll(context.Background(), a, plan)
+	staged, err := stageAll(context.Background(), a, plan, nil)
 	if err != nil {
 		if discardErr := staged.discard(); discardErr != nil {
 			return errors.Join(err, discardErr)
@@ -461,7 +503,7 @@ func undoSwapped(dest, hold string, swapped bool) error {
 	if _, err := os.Stat(hold); err != nil {
 		return fmt.Errorf("previous copy of %s is missing: %w", dest, err)
 	}
-	junk := dest + ".gmanager-undo"
+	junk := dest + undoSuffix
 	if err := os.RemoveAll(junk); err != nil {
 		return err
 	}
@@ -504,8 +546,8 @@ func swapPath(dest, src string, dir bool) (string, error) {
 	if !dir && info.IsDir() {
 		return "", fmt.Errorf("config path %s is a directory", dest)
 	}
-	hold := holdPath(dest)
-	if err := os.RemoveAll(hold); err != nil {
+	hold, err := allocateHold(dest)
+	if err != nil {
 		return "", err
 	}
 	if err := renameRetry(dest, hold); err != nil {
@@ -524,7 +566,27 @@ func swapPath(dest, src string, dir bool) (string, error) {
 }
 
 func holdPath(dest string) string {
-	return filepath.Join(filepath.Dir(dest), ".gmanager-hold-"+filepath.Base(dest))
+	return filepath.Join(filepath.Dir(dest), holdPrefix+filepath.Base(dest))
+}
+
+// allocateHold picks a hold name that is not already on disk. An existing
+// hold is a previous copy and is not deleted here.
+func allocateHold(dest string) (string, error) {
+	base := holdPath(dest)
+	for i := 0; i < 1000; i++ {
+		name := base
+		if i > 0 {
+			name = fmt.Sprintf("%s.%d", base, i+1)
+		}
+		_, err := os.Lstat(name)
+		if errors.Is(err, os.ErrNotExist) {
+			return name, nil
+		}
+		if err != nil {
+			return "", err
+		}
+	}
+	return "", errors.New("could not allocate a hold name")
 }
 
 func matchConfigs(man Manifest, files []core.ConfigFile) error {

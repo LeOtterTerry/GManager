@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -197,6 +198,52 @@ func (s *Server) postRestore(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) postDiscardBackup(w http.ResponseWriter, r *http.Request) {
+	if !s.knownInstance(w, r) {
+		return
+	}
+	body, err := readBody(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: "invalid_body", Message: bodyReadMessage(err)})
+		return
+	}
+	s.accept(w, r, body, func() decision {
+		ok, err := confirmed(body)
+		if err != nil {
+			return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "invalid_body", Message: "body must be JSON"}}
+		}
+		if !ok {
+			return decision{Status: http.StatusBadRequest, Body: errorBody{
+				Error:   "confirm_required",
+				Message: "discard requires confirm=true",
+			}}
+		}
+		id, err := backupID(body)
+		if err != nil {
+			return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "backup_id_required", Message: "discard requires a backup id"}}
+		}
+		if s.archives == nil {
+			return decision{Status: http.StatusNotImplemented, Body: errorBody{
+				Error:   "not_implemented",
+				Message: "backup directory is not configured",
+			}}
+		}
+		if err := s.archives.Discard(id); err != nil {
+			if errors.Is(err, backup.ErrInvalidID) {
+				return decision{Status: http.StatusBadRequest, Body: errorBody{Error: "invalid_backup_id", Message: "invalid backup id"}}
+			}
+			if errors.Is(err, backup.ErrNotFound) {
+				return decision{Status: http.StatusNotFound, Body: errorBody{Error: "not_found", Message: "unknown backup"}}
+			}
+			if errors.Is(err, backup.ErrNotQuarantined) {
+				return decision{Status: http.StatusConflict, Body: errorBody{Error: "not_quarantined", Message: "only a quarantined backup can be deleted"}}
+			}
+			return decision{Status: http.StatusInternalServerError, Body: errorBody{Error: "internal", Message: "could not discard backup"}}
+		}
+		return decision{Status: http.StatusOK, Body: map[string]any{"action": "discard", "id": id}}
+	})
+}
+
 func (s *Server) getBackups(w http.ResponseWriter, r *http.Request) {
 	if !s.knownInstance(w, r) {
 		return
@@ -352,6 +399,14 @@ func (s *Server) restoreWork(ctx context.Context, id string, useArchived bool) (
 			return nil, stopErr
 		}
 	}
+	if s.afterQuiesce != nil {
+		s.afterQuiesce()
+	}
+	if dest.UserDir != "" && !backup.SamePath(dest.UserDir, current.UserDir) {
+		if err := backup.RefuseForeign(dest.UserDir); err != nil {
+			return nil, s.finishStopped(wasRunning, err)
+		}
+	}
 	saves, err := s.mod.SavePaths(dest)
 	if err != nil {
 		return nil, s.finishStopped(wasRunning, err)
@@ -368,6 +423,8 @@ func (s *Server) restoreWork(ctx context.Context, id string, useArchived bool) (
 	if err := s.archives.Verify(safety.ID); err != nil {
 		return nil, s.finishStopped(wasRunning, fmt.Errorf("safety backup %s failed verification: %w", safety.ID, err))
 	}
+	s.archives.AdaptConfig = s.alignSaveDir(dest.UserDir)
+	defer func() { s.archives.AdaptConfig = nil }()
 	if err := s.archives.RestoreInto(ctx, id, dest, s.mod, safety.ID); err != nil {
 		return nil, s.finishStopped(wasRunning, fmt.Errorf("safety backup %s was kept: %w", safety.ID, err))
 	}
@@ -457,6 +514,58 @@ func (s *Server) requireQuiesced() error {
 		return backup.ErrServerRunning
 	}
 	return nil
+}
+
+// alignSaveDir rewrites an archived config so its userdir is the folder
+// being restored into. Bytes that already name that folder are returned
+// unchanged. Invalid JSON, or a userdir that cannot be made to match, refuses
+// the restore before any live file is swapped.
+func (s *Server) alignSaveDir(dest string) func(rel string, body []byte) ([]byte, error) {
+	primary := ""
+	if files := s.mod.ConfigFiles(s.inst); len(files) > 0 {
+		primary = filepath.ToSlash(files[0].RelPath)
+	}
+	return func(rel string, body []byte) ([]byte, error) {
+		if primary == "" || filepath.ToSlash(rel) != primary {
+			return body, nil
+		}
+		if !json.Valid(body) {
+			return nil, errors.New("refusing to restore: config is not valid JSON")
+		}
+		named, ok := s.mod.ConfigSaveDir(body)
+		if !ok {
+			return nil, errors.New("refusing to restore: config does not name a save directory")
+		}
+		if backup.SamePath(named, dest) {
+			return body, nil
+		}
+		updated, err := setUserDir(body, dest)
+		if err != nil {
+			return nil, fmt.Errorf("refusing to restore: %w", err)
+		}
+		named, ok = s.mod.ConfigSaveDir(updated)
+		if !ok || !backup.SamePath(named, dest) {
+			return nil, errors.New("refusing to restore: config userdir could not be rewritten to the destination")
+		}
+		return updated, nil
+	}
+}
+
+func setUserDir(body []byte, dir string) ([]byte, error) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return nil, err
+	}
+	raw, err := json.Marshal(dir)
+	if err != nil {
+		return nil, err
+	}
+	obj["userdir"] = raw
+	out, err := json.MarshalIndent(obj, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(out, '\n'), nil
 }
 
 func (s *Server) withSaveDir(inst core.Instance) core.Instance {

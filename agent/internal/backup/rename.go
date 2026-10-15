@@ -2,24 +2,37 @@ package backup
 
 import "time"
 
-const renameAttempts = 8
+// sharingRetryFor is how long a Windows sharing violation is retried.
+// Access denied fails after a short second attempt instead of waiting this out.
+const sharingRetryFor = 8 * time.Second
 
-// renameRetry retries sharing-violation and access-denied errors.
-// Those show up on Windows when a scanner or the game still has the file open.
-// Other errors return immediately.
+// renameRetry retries sharing-violation errors for several seconds.
+// A persistent access-denied error is returned quickly. Other errors return
+// on the first attempt.
 func renameRetry(oldpath, newpath string) error {
-	delay := 5 * time.Millisecond
+	deadline := time.Now().Add(sharingRetryFor)
+	delay := 20 * time.Millisecond
+	denied := 0
 	var err error
-	for attempt := 0; attempt < renameAttempts; attempt++ {
+	for {
 		err = renameOnce(oldpath, newpath)
 		if err == nil {
 			return nil
 		}
-		if !retryableRename(err) || attempt == renameAttempts-1 {
+		if isAccessDenied(err) {
+			denied++
+			if denied >= 2 {
+				return err
+			}
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		if !isSharingViolation(err) || !time.Now().Before(deadline) {
 			return err
 		}
 		time.Sleep(delay)
-		delay *= 2
+		if delay < time.Second {
+			delay *= 2
+		}
 	}
-	return err
 }

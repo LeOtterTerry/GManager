@@ -8,4 +8,6 @@ func renameOnce(oldpath, newpath string) error {
 	return os.Rename(oldpath, newpath)
 }
 
-func retryableRename(error) bool { return false }
+func isSharingViolation(error) bool { return false }
+
+func isAccessDenied(error) bool { return false }

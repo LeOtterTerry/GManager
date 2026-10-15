@@ -111,6 +111,18 @@ func main() {
 	if err := backup.ValidateDir(dirBackup, dir); err != nil {
 		stderr.Fatal(err)
 	}
+	recoverPaths := []string{dir, filepath.Join(dir, plainsofpain.ConfigRelPath)}
+	if *userDir != "" {
+		recoverPaths = append(recoverPaths, *userDir)
+	}
+	if raw, readErr := os.ReadFile(editor.ConfigPath()); readErr == nil {
+		if save, ok := mod.ConfigSaveDir(raw); ok {
+			recoverPaths = append(recoverPaths, save)
+		}
+	}
+	if err := backup.Recover(recoverPaths...); err != nil {
+		stderr.Fatal(err)
+	}
 	srv, err := api.New(api.Options{
 		Token:      token,
 		InstanceID: *instance,

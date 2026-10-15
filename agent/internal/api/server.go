@@ -87,8 +87,12 @@ type Server struct {
 	backup     supervisor.BackupFunc
 	archives   *backup.Store
 	userDir    string
-	acceptMu   sync.Mutex
-	handler    http.Handler
+	// afterQuiesce runs after restore has stopped the server, before the
+	// destination is checked again. Tests use it to fill a foreign directory
+	// during that window.
+	afterQuiesce func()
+	acceptMu     sync.Mutex
+	handler      http.Handler
 }
 
 // New builds a server. Token, module, editor, and instance id are required.
@@ -203,6 +207,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/v1/servers/{instanceId}/update", s.postUpdate)
 	mux.HandleFunc("POST /api/v1/servers/{instanceId}/backup", s.postBackup)
 	mux.HandleFunc("GET /api/v1/servers/{instanceId}/backups", s.getBackups)
+	mux.HandleFunc("POST /api/v1/servers/{instanceId}/backups/discard", s.postDiscardBackup)
 	mux.HandleFunc("POST /api/v1/servers/{instanceId}/restore", s.postRestore)
 	mux.HandleFunc("GET /api/v1/servers/{instanceId}/config", s.getConfig)
 	mux.HandleFunc("PUT /api/v1/servers/{instanceId}/config", s.putConfig)

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -59,9 +60,10 @@ type sourceFile struct {
 }
 
 type archive struct {
-	man   Manifest
-	files map[string]*zip.File
-	z     *zip.ReadCloser
+	man      Manifest
+	files    map[string]*zip.File
+	z        *zip.ReadCloser
+	unsigned bool
 }
 
 func (a *archive) Close() error {
@@ -232,7 +234,10 @@ func openArchive(path string, opt openOpts) (*archive, error) {
 		return nil, err
 	}
 	if opt.mac {
-		if err := checkManifestMAC(a.man, opt.key); err != nil {
+		err := checkManifestMAC(a.man, opt.key)
+		if errors.Is(err, ErrUnsigned) {
+			a.unsigned = true
+		} else if err != nil {
 			if closeErr := a.Close(); closeErr != nil {
 				return nil, errors.Join(err, closeErr)
 			}
@@ -280,6 +285,7 @@ func checkManifest(man Manifest, files map[string]*zip.File, hash bool) error {
 		return err
 	}
 	seen := map[string]struct{}{}
+	folded := map[string]string{}
 	for _, f := range man.Files {
 		expect, err := zipPathFor(f.Role, f.Rel, f.Root)
 		if err != nil {
@@ -288,6 +294,11 @@ func checkManifest(man Manifest, files map[string]*zip.File, hash bool) error {
 		if f.Path != expect {
 			return fmt.Errorf("%w: path %s", ErrIntegrity, f.Path)
 		}
+		fold := strings.ToLower(f.Path)
+		if prev, ok := folded[fold]; ok && prev != f.Path {
+			return fmt.Errorf("%w: case-colliding paths %s and %s", ErrIntegrity, prev, f.Path)
+		}
+		folded[fold] = f.Path
 		if f.Role == roleSave && (f.Root < 0 || f.Root >= len(man.Saves)) {
 			return fmt.Errorf("%w: save index for %s", ErrIntegrity, f.Path)
 		}
@@ -378,7 +389,9 @@ func macManifest(man Manifest, key []byte) (string, error) {
 
 func checkManifestMAC(man Manifest, key []byte) error {
 	if man.HMAC == "" {
-		return fmt.Errorf("%w: manifest hmac missing", ErrIntegrity)
+		// Version 1 archives written before the key existed have no hmac.
+		// Callers may hash-check them and then sign them in place.
+		return ErrUnsigned
 	}
 	sum, err := macManifest(man, key)
 	if err != nil {

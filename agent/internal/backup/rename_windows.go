@@ -30,8 +30,12 @@ func renameOnce(oldpath, newpath string) error {
 	return windows.MoveFileEx(src, dst, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH)
 }
 
-func retryableRename(err error) bool {
-	return errors.Is(err, windows.ERROR_SHARING_VIOLATION) || errors.Is(err, windows.ERROR_ACCESS_DENIED)
+func isSharingViolation(err error) bool {
+	return errors.Is(err, windows.ERROR_SHARING_VIOLATION)
+}
+
+func isAccessDenied(err error) bool {
+	return errors.Is(err, windows.ERROR_ACCESS_DENIED)
 }
 
 // extendedPath opts into the long-path form so a rename past MAX_PATH works

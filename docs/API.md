@@ -112,7 +112,7 @@ The agent does not write `server.json` when a start job runs.
 
 The backup directory is `--backup-dir`. When that flag is empty the directory is `<data-dir>/backups`. It must be absolute, must not be a UNC path, and must not sit inside the server directory (or the other way around). The installer may still suggest `P:\GManager\Backups` when drive `P:` exists; the agent does not select that path on its own.
 
-`--backup-keep` (default **10**) is applied per kind (`manual`, `update`, `safety`). A manual backup is not deleted to make room for an update or a safety zip. Pruning always leaves at least one zip that still verifies, and it never deletes the zip that is about to be restored or the safety zip just written for that restore. Leftover `*.zip.partial` files are removed when a backup is written or listed.
+`--backup-keep` (default **10**) is applied per kind (`manual`, `update`, `safety`). A manual backup is not deleted to make room for an update or a safety zip. Pruning always leaves at least one zip that still verifies, and it never deletes the zip that is about to be restored or the safety zip just written for that restore. A zip that cannot be opened or whose manifest HMAC does not verify is not deleted: it is renamed to `<id>.zip.quarantine` and listed with `corrupt: true` and `quarantined: true`. `POST .../backups/discard` with `confirm: true` and that id is the only way to remove it. A live zip is not discarded. Leftover `*.zip.partial` files are removed when a backup is written or listed. If `backup.hmac` and its copies are all missing while any zip or quarantine file exists, backup and list fail instead of creating a new key.
 
 The save directory is `--user-dir` when that flag is set. Otherwise it is `userdir` from `server.json`. The Plains of Pain default save path is unverified, so a backup with neither value fails the job with `save path unknown` and writes nothing. The agent does not guess a path.
 
@@ -126,7 +126,7 @@ Each zip is named with a UTC timestamp id (`20060102T150405.000000000Z`, plus `-
 - `saves/<index>/<relative path>` for each save directory
 - `config/<relative path>` for each module config file (`configs/server.json` for Plains of Pain)
 
-Each file record has `path`, `sha256` (uncompressed bytes), `size`, `role`, and `rel`. The manifest also carries `hmac`, an HMAC-SHA256 over the canonical manifest. The key is an owner-only file at `<data-dir>/backup.hmac` and is not stored in the zip, so rewriting a hash to match a tampered file does not verify. The manifest does not contain file contents. A server password in `server.json` is inside the zip, because restore needs it, and is not copied into the list response or the manifest. The zip file is created with mode `0600`. Paths reject `:`, Windows reserved device names, and names with a trailing dot or space. The reader refuses archives that exceed the entry count, uncompressed size, or compression-ratio caps.
+Each file record has `path`, `sha256` (uncompressed bytes), `size`, `role`, and `rel`. The manifest also carries `hmac`, an HMAC-SHA256 over the canonical manifest. The key is an owner-only file at `<data-dir>/backup.hmac`, with copies at `<data-dir>/backup.hmac.bak` and `<backup-dir>/integrity.key`. None of those files are stored in the zip, so rewriting a hash to match a tampered file does not verify. A version-1 manifest with an empty `hmac` and matching hashes is signed in place with the current key. A wrong `hmac`, or an empty `hmac` whose hashes do not match, is quarantined and is not rewritten. Stripping `hmac` while leaving the hashes unchanged is accepted once, because a process that can already replace files in the backup directory can replace the zip outright. The manifest does not contain file contents. A server password in `server.json` is inside the zip, because restore needs it, and is not copied into the list response or the manifest. The zip file is created with mode `0600`. Paths reject `:`, Windows reserved device names, and names with a trailing dot or space, and two paths that differ only by case. The reader refuses archives that exceed the entry count, uncompressed size, or compression-ratio caps.
 
 `GET /api/v1/servers/{instanceId}/backups?cursor=&limit=`
 
@@ -149,7 +149,15 @@ Each file record has `path`, `sha256` (uncompressed bytes), `size`, `role`, and 
 }
 ```
 
-Items have ids greater than the request cursor. `nextCursor` is the last item's id, or the request cursor when the page is empty. A zip that cannot be read is still listed, with `corrupt: true`, and does not fail the request. No backup store is **501** `not_implemented`.
+Items have ids greater than the request cursor. `nextCursor` is the last item's id, or the request cursor when the page is empty. A zip that cannot be read is still listed, with `corrupt: true`, and does not fail the request. A quarantined zip is listed the same way with `quarantined: true`. No backup store is **501** `not_implemented`. A missing integrity key while backups exist is **500** `backup_list_failed`.
+
+`POST /api/v1/servers/{instanceId}/backups/discard`
+
+```json
+{"confirm": true, "id": "20261015T152301.000000000Z"}
+```
+
+Missing `confirm: true` is **400** `confirm_required`. A missing id is **400** `backup_id_required`. A malformed id is **400** `invalid_backup_id`. An unknown id is **404** `not_found`. A zip that is still a normal backup is **409** `not_quarantined`. Success is **200** with `action` and `id`.
 
 `POST /api/v1/servers/{instanceId}/backup` accepts any JSON object, including an empty body. The job result includes `action`, `id`, `kind`, `bytes`, `fileCount`, `createdAt`, and `restarted`.
 
@@ -163,7 +171,7 @@ Items have ids greater than the request cursor. `nextCursor` is the last item's 
 
 Missing `confirm: true` is **400** `confirm_required`. A missing id is **400** `backup_id_required`. A malformed id is **400** `invalid_backup_id`. An unknown id is **404** `not_found`. Those checks happen before a job exists.
 
-The job verifies every sha256 and the manifest HMAC before it stops the server or changes a live file. It then stops the server if it is running, writes a `safety` backup of the destination it is about to replace, verifies that safety zip, and stages every save root and config file. Those staged copies are swapped into place together. Cancellation is ignored once the swaps start. If a swap fails, the verified safety backup is written back automatically. Config files are replaced with the archived bytes. The editor records that write, so the next config read is not reported as an external edit. A server that was running is started again. A failed restore leaves the safety zip in place. A hash or HMAC mismatch fails the job before the stop, and the live files stay as they were.
+The job verifies every sha256 and the manifest HMAC before it stops the server or changes a live file. It then stops the server if it is running, checks again that a non-current destination is still empty, writes a `safety` backup of the destination it is about to replace, verifies that safety zip, and stages every save root and config file. When the restore writes into the current save folder, `server.json`'s `userdir` is rewritten to that folder if the archived value names a different one. If the archived config is not valid JSON or the `userdir` value cannot be made to match, the job fails before any live file is swapped. Those staged copies are swapped into place together. Cancellation is ignored once the swaps start. If a swap fails, the previous files are renamed back first. The verified safety backup is written back only when that rename fails, and the hold copies are kept until that rollback finishes. The editor records the write, so the next config read is not reported as an external edit. A server that was running is started again. A failed restore leaves the safety zip in place. A hash or HMAC mismatch fails the job before the stop, and the live files stay as they were. On startup the agent also finishes an interrupted swap: a missing destination is restored from the newest `.gmanager-hold-*` copy, and leftover `.gmanager-restore-*` staging directories are removed.
 
 Scheduled backups are not in this slice. The writer is the one a scheduler would call.
 
