@@ -4,6 +4,7 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -52,7 +53,7 @@ func TestWindowsJobKillsGrandchild(t *testing.T) {
 			t.Fatal(err)
 		}
 		pid := grandchildPID(t, inst.Dir)
-		if !processAlive(pid) {
+		if !processAlive(t, pid) {
 			t.Fatalf("grandchild %d was not running", pid)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -71,7 +72,7 @@ func TestWindowsJobKillsGrandchild(t *testing.T) {
 			t.Fatal(err)
 		}
 		pid := grandchildPID(t, inst.Dir)
-		if !processAlive(pid) {
+		if !processAlive(t, pid) {
 			t.Fatalf("grandchild %d was not running", pid)
 		}
 		if err := sup.closeJobHandle(); err != nil {
@@ -99,7 +100,7 @@ func waitDead(t *testing.T, pid int) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if !processAlive(pid) {
+		if !processAlive(t, pid) {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -119,22 +120,26 @@ func waitStopped(t *testing.T, sup *Supervisor) {
 	t.Fatalf("server still running: %+v", sup.Status())
 }
 
-func processAlive(pid int) bool {
+func processAlive(t *testing.T, pid int) bool {
+	t.Helper()
 	if pid <= 0 {
 		return false
 	}
 	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
 	if err != nil {
-		return false
+		if errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
+			return false
+		}
+		t.Fatalf("OpenProcess(%d): %v", pid, err)
 	}
 	defer func() {
 		if closeErr := windows.CloseHandle(h); closeErr != nil {
-			return
+			t.Errorf("CloseHandle: %v", closeErr)
 		}
 	}()
 	var code uint32
 	if err := windows.GetExitCodeProcess(h, &code); err != nil {
-		return false
+		t.Fatalf("GetExitCodeProcess(%d): %v", pid, err)
 	}
 	const stillActive = 259
 	return code == stillActive

@@ -327,11 +327,11 @@ func (s *Supervisor) spawnLocked() (chan struct{}, error) {
 		return nil, err
 	}
 	if err := stdoutW.Close(); err != nil {
-		abortUnwatched(cmd, killFn, closeFn, stdoutR, stderrW, stderrR)
+		s.logAbort(abortUnwatched(cmd, killFn, closeFn, stdoutR, stderrW, stderrR))
 		return nil, err
 	}
 	if err := stderrW.Close(); err != nil {
-		abortUnwatched(cmd, killFn, closeFn, stdoutR, stderrR)
+		s.logAbort(abortUnwatched(cmd, killFn, closeFn, stdoutR, stderrR))
 		return nil, err
 	}
 	if s.closeFn != nil {
@@ -388,6 +388,9 @@ func (s *Supervisor) closeJobHandle() error {
 	s.mu.Lock()
 	fn := s.closeFn
 	s.closeFn = nil
+	// killFn closes over the same job handle. Drop it so a later stop
+	// does not call TerminateJobObject on a handle we already closed.
+	s.killFn = nil
 	s.mu.Unlock()
 	if fn == nil {
 		return nil
@@ -420,7 +423,7 @@ func closeAll(closers ...io.Closer) {
 	}
 }
 
-func abortUnwatched(cmd *exec.Cmd, killFn, closeFn func() error, pipes ...io.Closer) {
+func abortUnwatched(cmd *exec.Cmd, killFn, closeFn func() error, pipes ...io.Closer) error {
 	var killErr, waitErr, closeErr error
 	if killFn != nil {
 		killErr = killFn()
@@ -438,7 +441,14 @@ func abortUnwatched(cmd *exec.Cmd, killFn, closeFn func() error, pipes ...io.Clo
 	}
 	closeAll(pipes...)
 	if killErr != nil || waitErr != nil || closeErr != nil {
-		return
+		return fmt.Errorf("kill: %v; wait: %v; close: %v", killErr, waitErr, closeErr)
+	}
+	return nil
+}
+
+func (s *Supervisor) logAbort(err error) {
+	if err != nil && s.log != nil {
+		s.log("abort unwatched process: " + err.Error())
 	}
 }
 

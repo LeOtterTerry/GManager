@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -130,7 +131,7 @@ func (s *Server) postRestore(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) startWork(ctx context.Context) (any, error) {
-	return s.guardConfig(func() (any, error) {
+	return s.guardConfig("start", func() (any, error) {
 		if err := s.sup.Start(ctx, s.inst, s.mod); err != nil {
 			return nil, err
 		}
@@ -149,7 +150,7 @@ func (s *Server) stopWork(ctx context.Context) (any, error) {
 }
 
 func (s *Server) restartWork(ctx context.Context) (any, error) {
-	return s.guardConfig(func() (any, error) {
+	return s.guardConfig("restart", func() (any, error) {
 		if err := s.sup.Restart(ctx); err != nil {
 			return nil, err
 		}
@@ -161,7 +162,7 @@ func (s *Server) installWork(ctx context.Context) (any, error) {
 	if s.steam == nil {
 		return nil, errors.New("steamcmd is not configured")
 	}
-	return s.guardConfig(func() (any, error) {
+	return s.guardConfig("install", func() (any, error) {
 		if err := s.sup.Install(ctx, s.steam); err != nil {
 			return nil, err
 		}
@@ -181,7 +182,7 @@ func (s *Server) updateWork(ctx context.Context) (any, error) {
 	if s.backup == nil {
 		return nil, supervisor.ErrBackupNotConfigured
 	}
-	return s.guardConfig(func() (any, error) {
+	return s.guardConfig("update", func() (any, error) {
 		if err := s.sup.Update(ctx, s.steam, s.backup); err != nil {
 			return nil, err
 		}
@@ -202,7 +203,7 @@ func (s *Server) processResult(action string) map[string]any {
 	}
 }
 
-func (s *Server) guardConfig(fn func() (any, error)) (any, error) {
+func (s *Server) guardConfig(action string, fn func() (any, error)) (any, error) {
 	before, err := fileSHA256(s.editor.ConfigPath())
 	if err != nil {
 		return nil, err
@@ -213,7 +214,7 @@ func (s *Server) guardConfig(fn func() (any, error)) (any, error) {
 		return nil, hashErr
 	}
 	if before != after {
-		return nil, errors.New("config was rewritten")
+		return nil, fmt.Errorf("config was rewritten on %s", action)
 	}
 	return result, err
 }

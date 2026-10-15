@@ -477,6 +477,47 @@ func TestCloseJobHandleWithoutAProcess(t *testing.T) {
 	}
 }
 
+func TestCloseJobHandleDropsKillFn(t *testing.T) {
+	sup := New(testPolicy(), nil)
+	var closed, killed bool
+	sup.closeFn = func() error {
+		closed = true
+		return nil
+	}
+	sup.killFn = func() error {
+		killed = true
+		return errors.New("stale job")
+	}
+	if err := sup.closeJobHandle(); err != nil {
+		t.Fatal(err)
+	}
+	if !closed || killed {
+		t.Fatalf("closed=%v killed=%v", closed, killed)
+	}
+	if sup.closeFn != nil || sup.killFn != nil {
+		t.Fatal("job callbacks survived closeJobHandle")
+	}
+}
+
+func TestAbortUnwatchedIsLogged(t *testing.T) {
+	err := abortUnwatched(nil,
+		func() error { return errors.New("job") },
+		func() error { return errors.New("handle") },
+	)
+	if err == nil || !strings.Contains(err.Error(), "job") || !strings.Contains(err.Error(), "handle") {
+		t.Fatalf("err = %v", err)
+	}
+	var lines []string
+	sup := New(testPolicy(), func(line string) {
+		lines = append(lines, line)
+	})
+	sup.logAbort(err)
+	sup.logAbort(nil)
+	if len(lines) != 1 || !strings.Contains(lines[0], "abort unwatched process:") || !strings.Contains(lines[0], "job") {
+		t.Fatalf("log = %q", lines)
+	}
+}
+
 func TestExitLineIsLogged(t *testing.T) {
 	inst := newFake(t, `{"exitBeforeReady":true}`)
 	pol := testPolicy()
