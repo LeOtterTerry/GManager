@@ -1,0 +1,11 @@
+{
+  "serverName": "Plains",
+  "password": "secret",
+  "maxPlayers": 10,
+  "difficulty": 1,
+  "worldSize": 21,
+  "port": 7777,
+  "queryPort": 27016,
+  "userdir": "C:/GManager/saves/placeholder",
+  "adminAccountIDs": ["STEAM64_PLACEHOLDER"]
+}

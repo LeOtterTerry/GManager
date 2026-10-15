@@ -28,6 +28,15 @@ go.work.sum
 # env file
 .env
 
+# Local agent data and config backups
+/data/
+agent/data/
+*.bak
+
+# Node
+node_modules/
+dist/
+
 # Editor/IDE
 # .idea/
 # .vscode/
